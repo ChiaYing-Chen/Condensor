@@ -107,6 +107,20 @@ async function initDB() {
     console.log('✅ `system_settings` table ready.');
 
     // ============================================================
+    // 6. decision_profiles - 處置篩選公式腳本（共用儲存）
+    // ============================================================
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS decision_profiles (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) UNIQUE NOT NULL,           -- 腳本名稱（唯一鍵）
+        remark TEXT DEFAULT '',                       -- 備註說明
+        rules JSONB NOT NULL,                        -- 公式陣列 [{id, formula, enabled}]
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    console.log('✅ `decision_profiles` table ready.');
+
+    // ============================================================
     // 預設資料
     // ============================================================
 

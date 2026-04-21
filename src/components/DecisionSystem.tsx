@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Settings2, ShieldAlert, Wrench, AlertTriangle, Database, Plus, Trash2, Loader2, Play, Download, Save, Bookmark } from 'lucide-react';
+import * as XLSX from 'xlsx';
 
 interface DecisionSystemProps {
   unitData: any;
@@ -172,14 +173,20 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     const remark = prompt('請撰寫備註說明 (選填，例如: 用於大修年度全面檢測)：') || '';
     
     try {
-      await fetch(`${import.meta.env.BASE_URL}api/profiles`, {
+      const res = await fetch(`${import.meta.env.BASE_URL}api/profiles`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, remark, rules })
       });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        alert(`儲存失敗 (${res.status})：${errData.error || '伺服器錯誤，請確認 decision_profiles 資料表是否已建立。'}`);
+        return;
+      }
       const newProfiles = [...savedProfiles.filter(p => p.name !== name), { name, remark, rules }];
       setSavedProfiles(newProfiles);
       setActiveProfile(name);
+      alert(`✅ 公式「${name}」已成功儲存至伺服器！`);
     } catch (e) {
       alert('儲存失敗，請檢查網路連線或伺服器狀態。');
     }
@@ -283,26 +290,35 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     }
   };
 
-  const exportToCSV = () => {
+  const exportToExcel = () => {
     if (suggestedList.length === 0) return;
-    const headers = ['管號', '管齡', '本次深度(%)', '深度差異(%)', '觸發條件'];
-    const rows = suggestedList.map(item => [
-      item.id,
-      item.TubeAge,
-      item.this_depth.toFixed(1),
-      `+${item.depth_Diff.toFixed(1)}`,
-      item.reasons.join(' | ')
-    ]);
-    
-    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `${unitData.unit_id}_建議處置清單.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const rows = suggestedList.map(item => {
+      const parts = item.id.split('-');
+      return {
+        '區域': parts[0] || '',
+        '行/Row': Number(parts[1]) || parts[1] || '',
+        '列/Col': Number(parts[2]) || parts[2] || '',
+        '管齡(年)': item.TubeAge,
+        '本次深度(%)': parseFloat(item.this_depth.toFixed(1)),
+        '深度差異(%)': parseFloat(item.depth_Diff.toFixed(1)),
+        '觸發條件': item.reasons.join(' | ')
+      };
+    });
+
+    const ws = XLSX.utils.json_to_sheet(rows);
+    // 設定欄寬
+    ws['!cols'] = [
+      { wch: 8 },  // 區域
+      { wch: 8 },  // 行/Row
+      { wch: 8 },  // 列/Col
+      { wch: 10 }, // 管齡
+      { wch: 14 }, // 本次深度
+      { wch: 14 }, // 深度差異
+      { wch: 50 }, // 觸發條件
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '建議處置清單');
+    XLSX.writeFile(wb, `${unitData.unit_id}_建議處置清單.xlsx`);
   };
 
   if (!unitData || !unitData.unit_id) {
@@ -493,7 +509,7 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                 </button>
               )}
               <button
-                onClick={exportToCSV}
+                onClick={exportToExcel}
                 disabled={suggestedList.length === 0}
                 className="text-xs bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
               >
@@ -509,7 +525,9 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
             <table className="w-full text-left border-collapse">
               <thead className="sticky top-0 bg-slate-900 shadow-sm z-10">
                 <tr className="bg-slate-800/50 border-y border-slate-800">
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">管號</th>
+                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">區域</th>
+                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">行/Row</th>
+                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">列/Col</th>
                   <th className="py-3 px-4 text-sm font-semibold text-slate-400">管齡</th>
                   <th className="py-3 px-4 text-sm font-semibold text-slate-400">本次深度</th>
                   <th className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">深度差異</th>
@@ -519,7 +537,11 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
               <tbody className="divide-y divide-slate-800">
                 {suggestedList.map((item) => (
                   <tr key={item.id} className="hover:bg-slate-800/50">
-                    <td className="py-3 px-4 text-sm font-medium text-white">{item.id}</td>
+                    {(() => { const parts = item.id.split('-'); return (<>
+                      <td className="py-3 px-4 text-sm font-bold text-blue-300">{parts[0]}</td>
+                      <td className="py-3 px-4 text-sm font-medium text-white">{parts[1]}</td>
+                      <td className="py-3 px-4 text-sm font-medium text-white">{parts[2]}</td>
+                    </>); })()}
                     <td className="py-3 px-4 text-sm text-slate-300">{item.TubeAge} 年</td>
                     <td className="py-3 px-4 text-sm text-red-400 font-bold">{item.this_depth.toFixed(1)}%</td>
                     <td className="py-3 px-4 text-sm font-bold text-amber-500">
@@ -534,7 +556,7 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                 ))}
                 {suggestedList.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="py-8 text-center text-slate-500">
+                    <td colSpan={7} className="py-8 text-center text-slate-500">
                       目前無符合條件的建議項目，點擊「執行篩選」開始檢查。
                     </td>
                   </tr>

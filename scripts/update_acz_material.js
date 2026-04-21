@@ -1,31 +1,36 @@
 /**
  * update_acz_material.js
- * 將 Air Cooling Zone (ACZ) 範圍內的管子材質批次更新為「銅鎳(C71500)」
- * 範圍：TG-1 ~ TG-4，IL 與 IR 區，ROW 1~28，每 row 的 COL 上限如 ACZ_BOUNDARY 定義
  *
- * 執行方式：
- *   node scripts/update_acz_material.js
- * （需先確認 .env 資料庫連線設定正確）
+ * 功能：
+ *  Step 1 - 將 tubeMap.json 的全部管子批次初始化到 tube_registry（已存在略過）
+ *  Step 2 - 將 ACZ 範圍的管子材質更新為「銅鎳(C71500)」
+ *
+ * 執行：
+ *  node scripts/update_acz_material.js
  */
 
 import pg from 'pg';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { createRequire } from 'module';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
+const require = createRequire(import.meta.url);
+const tubeMap = require('../src/utils/tubeMap.json'); // 全部 6312 支的佈局
+
 const { Pool } = pg;
 const pool = new Pool({
-  user: process.env.DB_USER,
-  host: process.env.DB_HOST,
+  user:     process.env.DB_USER,
+  host:     process.env.DB_HOST,
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
-  port: process.env.DB_PORT,
+  port:     process.env.DB_PORT,
 });
 
-// ─── ACZ 邊界定義（row → 最大含 col） ───────────────────────────
+// ─── ACZ 邊界（row → 最大含 col）─────────────────────────────────
 const ACZ_BOUNDARY = {
   1: 9,  2: 9,  3: 10, 4: 10, 5: 11, 6: 11, 7: 12, 8: 12,
   9: 13, 10: 13, 11: 14, 12: 14, 13: 15, 14: 15, 15: 16, 16: 16,
@@ -33,86 +38,120 @@ const ACZ_BOUNDARY = {
   24: 19, 25: 19, 26: 18, 27: 18, 28: 17,
 };
 
-const UNITS  = ['TG-1', 'TG-2', 'TG-3', 'TG-4'];
-const ZONES  = ['IL', 'IR'];
+const UNITS    = ['TG-1', 'TG-2', 'TG-3', 'TG-4'];
+const ZONES    = ['IL', 'IR'];
 const MATERIAL = '銅鎳(C71500)';
 
-// ─── 建立 SQL CASE 條件（row_num + col_num 限制） ────────────────
-// 利用「(row_num, col_num) IN (...)」方式，為避免 parameter 數量過多
-// 先產生 tuple 字串直接內嵌 SQL（都是整數，安全無 injection 風險）
-function buildRowColTuples() {
-  const tuples = [];
-  for (const [rowStr, maxCol] of Object.entries(ACZ_BOUNDARY)) {
-    const row = parseInt(rowStr);
-    for (let col = 1; col <= maxCol; col++) {
-      tuples.push(`(${row},${col})`);
-    }
+/** 判斷是否屬於 ACZ 範圍 */
+function isACZ(zone, row, col) {
+  if (!ZONES.includes(zone)) return false;
+  const maxCol = ACZ_BOUNDARY[row];
+  return maxCol !== undefined && col <= maxCol;
+}
+
+/** 分批執行，避免超過 pg 參數上限 */
+async function batchInsert(client, rows, batchSize = 2000) {
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const chunk = rows.slice(i, i + batchSize);
+    await client.query(`
+      INSERT INTO tube_registry (unit_id, zone, row_num, col_num, material, status)
+      SELECT
+        unnest($1::text[]),
+        unnest($2::text[]),
+        unnest($3::int[]),
+        unnest($4::int[]),
+        unnest($5::text[]),
+        'active'
+      ON CONFLICT (unit_id, zone, row_num, col_num) DO NOTHING
+    `, [
+      chunk.map(r => r.unit_id),
+      chunk.map(r => r.zone),
+      chunk.map(r => r.row_num),
+      chunk.map(r => r.col_num),
+      chunk.map(r => r.material),
+    ]);
+    inserted += chunk.length;
+    process.stdout.write(`\r  已處理 ${inserted}/${rows.length} 筆...`);
   }
-  return tuples.join(',');
+  console.log('');
+  return inserted;
 }
 
 async function main() {
-  const tupleStr = buildRowColTuples();
-
-  // 計算預期更新數量
-  const totalPerZone = Object.values(ACZ_BOUNDARY).reduce((s, c) => s + c, 0); // 419
-  const expected = UNITS.length * ZONES.length * totalPerZone;
-  console.log(`\n====== ACZ 材質批次更新 ======`);
-  console.log(`材質更新目標：${MATERIAL}`);
-  console.log(`機組：${UNITS.join(', ')}`);
-  console.log(`區域：${ZONES.join(', ')}`);
-  console.log(`每區管數：${totalPerZone} 支`);
-  console.log(`預計更新總數：${expected} 筆（= ${UNITS.length} 機 × ${ZONES.length} 區 × ${totalPerZone}）`);
-  console.log(`\n開始更新...`);
-
+  const client = await pool.connect();
   try {
-    // 先查詢目前 ACZ 範圍內管數（確認 registry 已初始化）
-    const countRes = await pool.query(`
-      SELECT COUNT(*) AS cnt
-      FROM tube_registry
-      WHERE unit_id = ANY($1::text[])
-        AND zone = ANY($2::text[])
-        AND (row_num, col_num) IN (${tupleStr})
-    `, [UNITS, ZONES]);
+    await client.query('BEGIN');
 
-    const existingCount = parseInt(countRes.rows[0].cnt);
-    console.log(`資料庫中符合 ACZ 範圍的管子筆數：${existingCount}`);
-
-    if (existingCount === 0) {
-      console.warn(`⚠  找不到任何符合範圍的管子，請確認 tube_registry 是否已有資料。`);
-      await pool.end();
-      return;
+    // ══════════════════════════════════════════════════════════════
+    // Step 1：初始化 tube_registry
+    // ══════════════════════════════════════════════════════════════
+    console.log('\n====== Step 1：初始化 tube_registry ======');
+    const rows = [];
+    for (const unit of UNITS) {
+      for (const tube of tubeMap) {
+        rows.push({
+          unit_id: unit,
+          zone:    tube.zone,
+          row_num: tube.row,
+          col_num: tube.col,
+          material: isACZ(tube.zone, tube.row, tube.col) ? MATERIAL : '黃銅',
+        });
+      }
     }
+    console.log(`準備插入 ${rows.length} 筆（${UNITS.length} 機 × ${tubeMap.length} 支）`);
+    await batchInsert(client, rows);
 
-    // 執行批次更新
-    const updateRes = await pool.query(`
+    // ══════════════════════════════════════════════════════════════
+    // Step 2：強制更新 ACZ 範圍材質（處理已存在但材質未設定的舊資料）
+    // ══════════════════════════════════════════════════════════════
+    console.log('\n====== Step 2：更新 ACZ 材質 ======');
+
+    // 產生 (row_num, col_num) IN (...) 條件（純整數，安全）
+    const tupleParts = [];
+    for (const [rowStr, maxCol] of Object.entries(ACZ_BOUNDARY)) {
+      const row = parseInt(rowStr);
+      for (let col = 1; col <= maxCol; col++) {
+        tupleParts.push(`(${row},${col})`);
+      }
+    }
+    const tupleStr = tupleParts.join(',');
+
+    const updateRes = await client.query(`
       UPDATE tube_registry
       SET material = $1, updated_at = NOW()
       WHERE unit_id = ANY($2::text[])
-        AND zone = ANY($3::text[])
+        AND zone    = ANY($3::text[])
         AND (row_num, col_num) IN (${tupleStr})
     `, [MATERIAL, UNITS, ZONES]);
 
-    console.log(`\n✅ 更新完成！實際更新筆數：${updateRes.rowCount}`);
+    console.log(`✅ ACZ 材質更新完成，實際更新筆數：${updateRes.rowCount}`);
 
-    // 抽查驗證
-    const verifyRes = await pool.query(`
+    await client.query('COMMIT');
+
+    // ── 驗證 ──
+    const verifyRes = await client.query(`
       SELECT unit_id, zone, COUNT(*) AS cnt
       FROM tube_registry
       WHERE material = $1
         AND unit_id = ANY($2::text[])
-        AND zone = ANY($3::text[])
       GROUP BY unit_id, zone
       ORDER BY unit_id, zone
-    `, [MATERIAL, UNITS, ZONES]);
+    `, [MATERIAL, UNITS]);
 
-    console.log(`\n── 各機組/區域驗證 ──`);
+    console.log('\n── 驗證結果 ──');
     verifyRes.rows.forEach(r =>
-      console.log(`  ${r.unit_id} ${r.zone}: ${r.cnt} 支 設定為 ${MATERIAL}`)
+      console.log(`  ${r.unit_id} ${r.zone}: ${r.cnt} 支 → ${MATERIAL}`)
     );
+
+    const totalACZ = Object.values(ACZ_BOUNDARY).reduce((s, c) => s + c, 0);
+    console.log(`\n預期每機組 IL+IR 各 ${totalACZ} 支，共 ${totalACZ * 2} 支/機組`);
+
   } catch (err) {
-    console.error('❌ 更新失敗：', err.message);
+    await client.query('ROLLBACK');
+    console.error('\n❌ 發生錯誤，已 ROLLBACK：', err.message);
   } finally {
+    client.release();
     await pool.end();
   }
 }

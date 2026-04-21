@@ -453,9 +453,30 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
+// ================================================================
+//  自動確保 decision_profiles 資料表存在（補丁：若 init_db.js 未執行此表）
+// ================================================================
+const ensureDecisionProfilesTable = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS decision_profiles (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) UNIQUE NOT NULL,
+        remark TEXT DEFAULT '',
+        rules JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    console.log('✅ decision_profiles table ensured.');
+  } catch (err) {
+    console.error('⚠️  Failed to ensure decision_profiles table:', err.message);
+  }
+};
+
 // Start Server
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`Condensor Backend Server running on http://localhost:${port}`);
+  await ensureDecisionProfilesTable();
 });
 
 // ================================================================

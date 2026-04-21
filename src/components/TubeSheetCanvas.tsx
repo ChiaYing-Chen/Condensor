@@ -14,67 +14,54 @@ const ACZ_BOUNDARY: Record<number, number> = {
 };
 const ACZ_MAX_ROW = 28;
 
-/** 產生 ACZ 橆形頂點（raw 坐標空間） */
+/** 產生 ACZ 簡化多邊形：只取三個外側關鍵頂點（頂、峰、底），形成斜線輪廓 */
 function getACZPolygon(zone: 'IL' | 'IR'): { x: number; y: number }[] {
   const sign = zone === 'IL' ? -1 : 1;
-  const pts: { x: number; y: number }[] = [];
-  pts.push({ x: 0, y: 0.5 });                          // 頂-內角
-  pts.push({ x: sign * ACZ_BOUNDARY[1], y: 0.5 });     // 頂-外角
-  for (let row = 1; row <= ACZ_MAX_ROW; row++) {
-    const b = ACZ_BOUNDARY[row];
-    const nb = row < ACZ_MAX_ROW ? ACZ_BOUNDARY[row + 1] : null;
-    if (nb !== b) {                                     // 面局變化：轉角
-      pts.push({ x: sign * b, y: row + 0.5 });
-      if (nb !== null) pts.push({ x: sign * nb, y: row + 0.5 });
-    }
-  }
-  pts.push({ x: sign * ACZ_BOUNDARY[ACZ_MAX_ROW], y: ACZ_MAX_ROW + 0.5 }); // 底-外角
-  pts.push({ x: 0, y: ACZ_MAX_ROW + 0.5 });            // 底-內角
-  return pts;
+  // 間隙中點精確計算（以 IR 為例）：
+  //   col b 管中心 x = b-0.5，右緣 = b-0.1
+  //   col b+1 管中心 x = b+0.5，左緣 = b+0.1
+  //   → 間隙中點 = b  ←  不需要 +0.5
+  const topCol  = ACZ_BOUNDARY[1];           // row 1,  col 9  → gap x = ±9
+  const peakCol = ACZ_BOUNDARY[23];          // row 23, col 20 → gap x = ±20
+  const botCol  = ACZ_BOUNDARY[ACZ_MAX_ROW]; // row 28, col 17 → gap x = ±17
+
+  return [
+    { x: 0,                y: 0.5            }, // 頂-內（中心線）
+    { x: sign * topCol,    y: 0.5            }, // 頂-外（row 1 上方間隙）
+    { x: sign * peakCol,   y: 23.5           }, // 峰點-外（row 23 下方間隙）
+    { x: sign * botCol,    y: ACZ_MAX_ROW + 0.5 }, // 底-外（row 28 下方間隙）
+    { x: 0,                y: ACZ_MAX_ROW + 0.5 }, // 底-內（中心線）
+  ];
 }
 
-/** 在畫布上繪製 ACZ 粉紅輪廓框 */
+/** 在畫布上繪製 ACZ 粉紅輪廓框（直線 staircase，落在管束間隙） */
 function drawACZOverlay(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
   zones: ('IL' | 'IR')[],
   offsetX: number, offsetY: number, sc: number,
-  isMirrored: boolean, W: number, isPrintMode: boolean
+  isMirrored: boolean, W: number, _isPrintMode: boolean
 ) {
+  const c = ctx as any;
   ctx.save();
-  (ctx as any).strokeStyle = '#f472b6';
-  (ctx as any).lineWidth = 1.8;
-  (ctx as any).setLineDash([7, 4]);
-  (ctx as any).lineJoin = 'round';
+  c.strokeStyle = 'rgba(244,114,182,0.95)';
+  c.lineWidth = 2.5;
+  c.setLineDash([]);
+  c.lineJoin = 'miter';
+  c.lineCap = 'butt';
+
   for (const zone of zones) {
     const poly = getACZPolygon(zone);
-    (ctx as any).beginPath();
-    poly.forEach((pt, i) => {
+    c.beginPath();
+    poly.forEach((pt: { x: number; y: number }, i: number) => {
       let cx = offsetX + pt.x * sc;
       if (isMirrored) cx = W - cx;
       const cy = offsetY + pt.y * sc;
-      if (i === 0) (ctx as any).moveTo(cx, cy); else (ctx as any).lineTo(cx, cy);
+      if (i === 0) c.moveTo(cx, cy); else c.lineTo(cx, cy);
     });
-    (ctx as any).closePath();
-    (ctx as any).stroke();
-    // 標示文字
-    const topPt = poly[1]; // 頂-外角
-    let lx = offsetX + topPt.x * sc;
-    if (isMirrored) lx = W - lx;
-    const ly = offsetY + topPt.y * sc;
-    (ctx as any).setLineDash([]);
-    (ctx as any).fillStyle = '#f472b6';
-    const fs = Math.max(9, Math.min(14, sc * 0.9));
-    (ctx as any).font = `bold ${fs}px sans-serif`;
-    (ctx as any).textBaseline = 'bottom';
-    if (zone === 'IL') {
-      (ctx as any).textAlign = isMirrored ? 'left' : 'right';
-      (ctx as any).fillText('Air Cooling Zone', lx + (isMirrored ? 4 : -4), ly - 3);
-    } else {
-      (ctx as any).textAlign = isMirrored ? 'right' : 'left';
-      (ctx as any).fillText('Air Cooling Zone', lx + (isMirrored ? -4 : 4), ly - 3);
-    }
-    (ctx as any).setLineDash([7, 4]);
+    c.closePath();
+    c.stroke();
   }
+
   ctx.restore();
 }
 
@@ -92,7 +79,12 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
   const [currentYearIndex, setCurrentYearIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>('before');
-  
+
+  // 播放步驟：每步代表 (yearIndex, viewMode) 的一格
+  // 序列形式：[{yi:0,vm:'before'},{yi:0,vm:'after'},{yi:1,vm:'before'},{yi:1,vm:'after'},...]
+  // 依 availableYears 和 maintenanceYears 動態計算
+  const [playStepIndex, setPlayStepIndex] = useState(0);
+
   // records maps
   const [yearRecords, setYearRecords] = useState<Record<string, any>>({});
   const [maintenanceRecords, setMaintenanceRecords] = useState<Record<string, any>>({});
@@ -107,7 +99,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
   const [showGridMarkers, setShowGridMarkers] = useState(false);
   // 處置顏色視覺功能
   const [showDisposalColors, setShowDisposalColors] = useState(false);
-  const [showOldPlugs, setShowOldPlugs] = useState(true);
+  const [showOldPlugs, setShowOldPlugs] = useState(false);
   // 快速上傳 Modal
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<'idle'|'uploading'|'success'|'error'|'password_required'>('idle');
@@ -126,6 +118,18 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
 
   const currentYear = availableYears.length > 0 ? availableYears[currentYearIndex] : null;
   const hasAfterData = currentYear ? maintenanceYears.includes(currentYear) : false;
+
+  // 播放步驟序列：按「每年先before，若有after則接after」展開
+  const playSteps = useMemo(() => {
+    const steps: Array<{ yi: number; vm: ViewMode }> = [];
+    availableYears.forEach((year, yi) => {
+      steps.push({ yi, vm: 'before' });
+      if (maintenanceYears.includes(year)) {
+        steps.push({ yi, vm: 'after' });
+      }
+    });
+    return steps;
+  }, [availableYears, maintenanceYears]);
 
   // Initialize: Fetch available years and tube registry for this unit
   useEffect(() => {
@@ -205,24 +209,28 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
     }
   }, [currentYear, maintenanceYears, viewMode]);
 
-  // Autoplay
+  // Autoplay：依 playSteps 序列依序推進
   useEffect(() => {
     let interval: number;
-    if (isPlaying && availableYears.length > 0) {
+    if (isPlaying && playSteps.length > 0) {
       interval = window.setInterval(() => {
-        setCurrentYearIndex((prev) => {
-          if (prev >= availableYears.length - 1) {
+        setPlayStepIndex((prev) => {
+          const next = prev + 1;
+          if (next >= playSteps.length) {
             setIsPlaying(false);
             return prev;
           }
-          return prev + 1;
+          // 同步更新 yearIndex 與 viewMode
+          setCurrentYearIndex(playSteps[next].yi);
+          setViewMode(playSteps[next].vm);
+          return next;
         });
       }, 2000);
     }
     return () => {
       if (interval) clearInterval(interval);
     }
-  }, [isPlaying, availableYears.length]);
+  }, [isPlaying, playSteps]);
 
   // 主渲染函數（實際畫布工作）
   const drawCanvas = (blinkVisible: boolean, isPrintMode: boolean = false, isMirrored: boolean = false, annotationText: string = '') => {
@@ -311,7 +319,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
     ctx.lineTo(vLineX, offsetY + maxY * scale);
     ctx.stroke();
 
-    const tubeRadius = Math.max(1, scale * 0.4);
+    const tubeRadius = Math.max(1, scale * 0.36); // 間隙=scale*0.28（原0.4時僅0.2，增加40%）
 
     // Y axis Row labels - both sides (every 5 rows)
     if (showGridMarkers) {
@@ -355,6 +363,12 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
       });
     }
 
+    // ACZ 輪廓標記（先畫，管束圓點後覆蓋在上）
+    const aczZones: ('IL' | 'IR')[] = [];
+    if (quadrantFilter === 'ALL' || quadrantFilter === 'IL') aczZones.push('IL');
+    if (quadrantFilter === 'ALL' || quadrantFilter === 'IR') aczZones.push('IR');
+    if (aczZones.length > 0) drawACZOverlay(ctx, aczZones, offsetX, offsetY, scale, false, width, isPrintMode);
+
     filteredTubes.forEach(tube => {
       let cx = offsetX + tube.x * scale;
       if (isMirrored) {
@@ -369,6 +383,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
       let color = '#334155'; // default empty
       let isBlink = false;
       let isPlugged = false; // 提升至外層，供繪 X 使用
+      let isOldPlug = false; // 舊塞管標記（灰色圓 + 紅X）
       
       if (record) {
         isPlugged = code === 'PLG';
@@ -428,13 +443,16 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
            isBlink = false; // 未強調管絕對不能閃爍
         }
       } else if (registryRecords[tube.id]?.status === 'plugged') {
-        // 舊塞管：ON 時橘色顯示，OFF 時融入背景
-        color = isPrintMode ? '#cbd5e1' : (showOldPlugs ? '#f97316' : '#1e293b');
+        // 舊塞管：showDisposalColors && showOldPlugs 同時 ON → 灰色圓 + 紅X，否則融入背景
+        const showOldPlugStyle = showDisposalColors && showOldPlugs;
+        color = isPrintMode ? '#cbd5e1' : (showOldPlugStyle ? '#64748b' : '#1e293b');
+        if (showOldPlugStyle) isOldPlug = true;
         let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : false;
         if (highlightTubes && !isHighlighted) {
-           color = (showGridMarkers && tube.col % 5 === 0) 
-             ? (isPrintMode ? '#3b82f6' : '#cbd5e1') 
-             : (isPrintMode ? '#e2e8f0' : (showOldPlugs ? '#f97316' : '#1e293b'));
+           color = (showGridMarkers && tube.col % 5 === 0)
+             ? (isPrintMode ? '#3b82f6' : '#cbd5e1')
+             : (isPrintMode ? '#e2e8f0' : '#1e293b');
+           isOldPlug = false;
         }
       } else {
         // 列印模式下無資料管呈淡灰
@@ -487,8 +505,8 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
           ctx.fill();
       }
 
-      // 已塞管：疊加紅色 X 標記
-      if (isPlugged && color !== '#1e293b') { // 不在完全融入背景時才畫
+      // 已塞管 / 舊塞管：疊加紅色 X 標記
+      if ((isPlugged || isOldPlug) && color !== '#1e293b') {
         const xSize = tubeRadius * 0.55;
         const xLW = Math.max(1, tubeRadius * 0.35);
         ctx.save();
@@ -512,12 +530,6 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
         ctx.stroke();
       }
     });
-
-    // ACZ 輪廓標記
-    const aczZones: ('IL' | 'IR')[] = [];
-    if (quadrantFilter === 'ALL' || quadrantFilter === 'IL') aczZones.push('IL');
-    if (quadrantFilter === 'ALL' || quadrantFilter === 'IR') aczZones.push('IR');
-    if (aczZones.length > 0) drawACZOverlay(ctx, aczZones, offsetX, offsetY, scale, false, width, isPrintMode);
 
     if (annotationText) {
       // 確保文字在列印模式下清楚可見（深色 on 白底）
@@ -749,7 +761,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
       const sc = Math.min((W-pad*2)/((mxX-mnX)||1),(H-pad*2)/((mxY-mnY)||1));
       const ox = W/2-((mxX+mnX)/2)*sc;
       const oy = H/2-((mxY+mnY)/2)*sc;
-      const tr = Math.max(1, sc * 0.4);
+      const tr = Math.max(1, sc * 0.36);
 
       // row labels
       if (showGridMarkers) {
@@ -776,6 +788,12 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
         });
       }
 
+      // ACZ 輪廓標記（列印版，先畫讓管束覆蓋）
+      const aczZ: ('IL' | 'IR')[] = [];
+      if (quadrantFilter==='ALL'||quadrantFilter==='IL') aczZ.push('IL');
+      if (quadrantFilter==='ALL'||quadrantFilter==='IR') aczZ.push('IR');
+      if (aczZ.length > 0) drawACZOverlay(oc as any, aczZ, ox, oy, sc, mirrored, W, true);
+
       // tubes
       fTubes.forEach(tube => {
         let cx = ox + tube.x * sc;
@@ -798,10 +816,28 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
           else if (code==='COR') color='#ff3fa4';
           else if (code==='BLK'||code==='RST') color='#94a3b8';
           else { if (depth<=20) color='#10b981'; else if (depth<=40) color='#84cc16'; else if (depth<=60) color='#eab308'; else if (depth<=80) color='#f97316'; else color='#ef4444'; }
+          // 處置顏色覆蓋（showDisposalColors ON 且為篩選清單管子）
+          if (showDisposalColors && highlightTubes && isHL) {
+            if (maint?.action==='RPL') { color='#ef4444'; } // 換管 - 紅色
+            else if (maint?.action==='PLG') { color='#e879f9'; } // 塞管 - 紫粉色
+          }
           if (highlightTubes&&!isHL) color=(showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0';
         } else if (registryRecords[tube.id]?.status==='plugged') {
-          color='#cbd5e1';
-          if (highlightTubes&&!highlightTubes.has(tube.id)) color=(showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0';
+          // 舊塞管：showDisposalColors && showOldPlugs → 灰色圓 + 紅X，否則淡灰
+          const showOldStyle = showDisposalColors && showOldPlugs;
+          const skipByHL = highlightTubes && !highlightTubes.has(tube.id);
+          color = skipByHL
+            ? ((showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0')
+            : (showOldStyle ? '#64748b' : '#cbd5e1');
+          const drawOldX = showOldStyle && !skipByHL;
+          oc.fillStyle=color; oc.beginPath(); oc.arc(cx,cy,tr,0,Math.PI*2); oc.fill();
+          if (drawOldX) {
+            const xs=tr*0.55; const xlw=Math.max(0.8,tr*0.35);
+            oc.save(); oc.strokeStyle='#dc2626'; oc.lineWidth=xlw; oc.lineCap='round';
+            oc.beginPath(); oc.moveTo(cx-xs,cy-xs); oc.lineTo(cx+xs,cy+xs);
+            oc.moveTo(cx+xs,cy-xs); oc.lineTo(cx-xs,cy+xs); oc.stroke(); oc.restore();
+          }
+          return; // 舊塞管已自行繪製，跳過後續公用邏輯
         } else {
           color='#d1d5db';
           if (highlightTubes&&!highlightTubes.has(tube.id)) color=(showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0';
@@ -829,15 +865,56 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
         }
       });
 
-      // ACZ 輪廓標記（列印版）
-      const aczZ: ('IL' | 'IR')[] = [];
-      if (quadrantFilter==='ALL'||quadrantFilter==='IL') aczZ.push('IL');
-      if (quadrantFilter==='ALL'||quadrantFilter==='IR') aczZ.push('IR');
-      if (aczZ.length > 0) drawACZOverlay(oc as any, aczZ, ox, oy, sc, mirrored, W, true);
-
       // title
       oc.save(); oc.fillStyle='#0f172a'; oc.font='bold 26px sans-serif';
       oc.textAlign='left'; oc.textBaseline='top'; oc.fillText(label,18,14); oc.restore();
+
+      // LEGEND（處置顏色 ON 時才繪製）
+      if (showDisposalColors) {
+        type LegendItem = { color: string; label: string; isOldPlug?: boolean };
+        const legendItems: LegendItem[] = [
+          { color: '#ef4444', label: '換管' },
+          { color: '#e879f9', label: '塞管' },
+          ...(showOldPlugs ? [{ color: '#64748b', label: '舊塞管', isOldPlug: true }] : []),
+        ];
+        const dotR = 7;
+        const itemW = 80;
+        const legendW = legendItems.length * itemW + 16;
+        const legendH = 32;
+        const lx = W - legendW - 12;
+        const ly = H - legendH - 12;
+
+        // 背景
+        oc.save();
+        oc.fillStyle = 'rgba(15,23,42,0.75)';
+        oc.beginPath();
+        (oc as any).roundRect?.(lx, ly, legendW, legendH, 6) || oc.rect(lx, ly, legendW, legendH);
+        oc.fill();
+
+        // 項目
+        oc.font = 'bold 12px sans-serif';
+        oc.textBaseline = 'middle';
+        legendItems.forEach((item, i) => {
+          const ix = lx + 12 + i * itemW;
+          const iy = ly + legendH / 2;
+          // 圓點
+          oc.fillStyle = item.color;
+          oc.beginPath();
+          oc.arc(ix, iy, dotR, 0, Math.PI * 2);
+          oc.fill();
+          // 舊塞管：疊加紅色 X
+          if (item.isOldPlug) {
+            const xs = dotR * 0.6; const xlw = Math.max(0.8, dotR * 0.35);
+            oc.strokeStyle = '#dc2626'; oc.lineWidth = xlw; oc.lineCap = 'round';
+            oc.beginPath(); oc.moveTo(ix-xs,iy-xs); oc.lineTo(ix+xs,iy+xs);
+            oc.moveTo(ix+xs,iy-xs); oc.lineTo(ix-xs,iy+xs); oc.stroke();
+          }
+          oc.fillStyle = '#f8fafc';
+          oc.textAlign = 'left';
+          oc.fillText(item.label, ix + dotR + 4, iy);
+        });
+        oc.restore();
+      }
 
       return off.toDataURL('image/png');
     };
@@ -882,7 +959,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
                 {showDisposalColors && (
                   <button
                     onClick={() => setShowOldPlugs(p => !p)}
-                    className={`flex items-center gap-2 text-sm font-medium px-3 py-1.5 rounded-md transition ${showOldPlugs ? 'bg-orange-600 hover:bg-orange-500 text-white' : 'bg-slate-800 hover:bg-slate-700 text-slate-400'}`}
+                    className={`flex items-center gap-2 text-sm font-medium px-3 py-1.5 rounded-md transition ${showOldPlugs ? 'bg-slate-600 hover:bg-slate-500 text-white' : 'bg-slate-800 hover:bg-slate-700 text-slate-400'}`}
                   >
                     {showOldPlugs ? <Eye size={14}/> : <EyeOff size={14}/>} 舊塞管
                   </button>
@@ -891,7 +968,15 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
                   <div className="flex items-center gap-2 text-xs text-slate-300 bg-slate-800/60 px-3 py-1.5 rounded-md border border-slate-700">
                     <span className="inline-block w-3 h-3 rounded-full bg-red-500"/>換管
                     <span className="inline-block w-3 h-3 rounded-full bg-fuchsia-400 ml-1"/>塞管
-                    <span className="inline-block w-3 h-3 rounded-full bg-orange-500 ml-1"/>舊塞管
+                    {showOldPlugs && (
+                      <span className="inline-flex items-center gap-1 ml-1">
+                        <span className="relative inline-flex items-center justify-center w-3 h-3">
+                          <span className="absolute inset-0 rounded-full bg-slate-500"/>
+                          <span className="relative text-red-500 font-black" style={{fontSize:'8px',lineHeight:1}}>✕</span>
+                        </span>
+                        舊塞管
+                      </span>
+                    )}
                   </div>
                 )}
               </>
@@ -1084,60 +1169,118 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
         
         <div className="bg-slate-900 border-b border-slate-800 p-4 flex items-center gap-6">
           <div className="flex items-center gap-2">
+            {/* 跳回第一步 */}
             <button 
-              onClick={() => { setIsPlaying(false); setCurrentYearIndex(0); }}
+              onClick={() => {
+                setIsPlaying(false);
+                setPlayStepIndex(0);
+                setCurrentYearIndex(playSteps[0]?.yi ?? 0);
+                setViewMode(playSteps[0]?.vm ?? 'before');
+              }}
               className="p-2 text-slate-400 hover:bg-slate-800 rounded-full transition-colors disabled:opacity-50"
-              disabled={availableYears.length === 0}
+              disabled={playSteps.length === 0}
             >
               <SkipBack size={20} />
             </button>
+            {/* 播放 / 暫停 */}
             <button 
               onClick={() => {
-                if (currentYearIndex >= availableYears.length - 1) setCurrentYearIndex(0);
+                if (playStepIndex >= playSteps.length - 1) {
+                  // 已到末尾：重頭播放
+                  setPlayStepIndex(0);
+                  setCurrentYearIndex(playSteps[0]?.yi ?? 0);
+                  setViewMode(playSteps[0]?.vm ?? 'before');
+                }
                 setIsPlaying(!isPlaying);
               }}
               className="p-3 bg-blue-600 text-white hover:bg-blue-700 rounded-full transition-colors shadow-sm disabled:opacity-50"
-              disabled={availableYears.length === 0}
+              disabled={playSteps.length === 0}
             >
               {isPlaying ? <Pause size={24} /> : <Play size={24} className="ml-1" />}
             </button>
+            {/* 跳到最後一步 */}
             <button 
-              onClick={() => { setIsPlaying(false); setCurrentYearIndex(availableYears.length - 1); }}
+              onClick={() => {
+                setIsPlaying(false);
+                const last = playSteps.length - 1;
+                if (last >= 0) {
+                  setPlayStepIndex(last);
+                  setCurrentYearIndex(playSteps[last].yi);
+                  setViewMode(playSteps[last].vm);
+                }
+              }}
               className="p-2 text-slate-400 hover:bg-slate-800 rounded-full transition-colors disabled:opacity-50"
-              disabled={availableYears.length === 0}
+              disabled={playSteps.length === 0}
             >
               <SkipForward size={20} />
             </button>
           </div>
 
+          {/* 時間軸：每個 playStep 一個節點 */}
           <div className="flex-1 px-4">
             <div className="relative flex items-center justify-between">
-              <div className="absolute left-0 right-0 h-1 bg-slate-800 rounded-full top-1/2 -translate-y-1/2 z-0"></div>
+              <div className="absolute left-0 right-0 h-1 bg-slate-800 rounded-full top-[8px] z-0"></div>
               
-              {availableYears.map((year, idx) => (
-                <div key={year} className="relative z-10 flex flex-col items-center cursor-pointer group" onClick={() => { setIsPlaying(false); setCurrentYearIndex(idx); }}>
-                  <div className={`w-4 h-4 rounded-full border-2 transition-colors ${
-                    idx === currentYearIndex 
-                      ? 'bg-blue-500 border-blue-500 scale-125' 
-                      : idx < currentYearIndex 
-                        ? 'bg-blue-900 border-blue-700' 
-                        : 'bg-slate-800 border-slate-600 group-hover:border-blue-500'
-                  }`}></div>
-                  <span className={`absolute top-6 text-xs font-medium ${idx === currentYearIndex ? 'text-blue-400' : 'text-slate-500'}`}>
-                    {year}
-                  </span>
-                </div>
-              ))}
+              {playSteps.map((step, si) => {
+                const year = availableYears[step.yi];
+                const isActive = si === playStepIndex;
+                const isPast = si < playStepIndex;
+                const isBefore = step.vm === 'before';
+                return (
+                  <div
+                    key={`${year}-${step.vm}`}
+                    className="relative z-10 flex flex-col items-center cursor-pointer group"
+                    onClick={() => {
+                      setIsPlaying(false);
+                      setPlayStepIndex(si);
+                      setCurrentYearIndex(step.yi);
+                      setViewMode(step.vm);
+                    }}
+                  >
+                    {/* 節點圓點：before=藍，after=綠 */}
+                    <div className={`w-4 h-4 rounded-full border-2 transition-all duration-200 ${
+                      isActive
+                        ? (isBefore ? 'bg-blue-500 border-blue-400 scale-125 shadow-[0_0_8px_rgba(59,130,246,0.7)]' : 'bg-emerald-500 border-emerald-400 scale-125 shadow-[0_0_8px_rgba(16,185,129,0.7)]')
+                        : isPast
+                          ? (isBefore ? 'bg-blue-900 border-blue-700' : 'bg-emerald-900 border-emerald-700')
+                          : 'bg-slate-800 border-slate-600 group-hover:border-blue-500'
+                    }`}></div>
+                    {/* 標籤：年份（before 才顯示）+ 檢測/處置 */}
+                    <div className="absolute top-6 flex flex-col items-center gap-0.5">
+                      {isBefore && (
+                        <span className={`text-xs font-bold whitespace-nowrap ${
+                          isActive ? 'text-blue-300' : isPast ? 'text-slate-500' : 'text-slate-600'
+                        }`}>{year}</span>
+                      )}
+                      <span className={`text-[10px] whitespace-nowrap px-1.5 py-0.5 rounded-full font-medium ${
+                        isActive
+                          ? (isBefore ? 'bg-blue-900/60 text-blue-300' : 'bg-emerald-900/60 text-emerald-300')
+                          : isPast
+                            ? 'text-slate-600'
+                            : 'text-slate-700'
+                      }`}>
+                        {isBefore ? '大修檢測' : '大修處置'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
               
-              {availableYears.length === 0 && (
+              {playSteps.length === 0 && (
                 <div className="text-slate-500 text-sm italic py-2">無歷史年份資料，請先匯入</div>
               )}
             </div>
           </div>
-          
-          <div className="text-right min-w-[100px]">
+
+          {/* 右側顯示目前年份與模式 */}
+          <div className="text-right min-w-[110px]">
             <div className="text-sm text-slate-400">顯示年份</div>
             <div className="text-2xl font-bold text-white">{currentYear || '----'}</div>
+            <div className={`text-xs mt-0.5 font-medium ${
+              viewMode === 'before' ? 'text-blue-400' : 'text-emerald-400'
+            }`}>
+              {viewMode === 'before' ? '大修檢測' : '大修處置'}
+            </div>
           </div>
         </div>
 
