@@ -15,6 +15,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [dbOffline, setDbOffline] = useState(false);
   const [highlightTubes, setHighlightTubes] = useState<Set<string> | null>(null);
+  const [filterSourceYear, setFilterSourceYear] = useState<number | null>(null);
+  const [filterBaseYear, setFilterBaseYear] = useState<number | null>(null);
 
   useEffect(() => {
     fetch(`${import.meta.env.BASE_URL}api/units`)
@@ -54,11 +56,11 @@ export default function App() {
   const renderContent = () => {
     switch (activeTab) {
       case 'dashboard': return <Dashboard unitData={currentUnit} />;
-      case 'canvas': return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} onClearHighlight={() => setHighlightTubes(null)} />;
+      case 'canvas': return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
       case 'trend': return <TrendAnalysis unitData={currentUnit} />;
-      case 'decision': return <DecisionSystem unitData={currentUnit} onApplyToVisual={(ids: string[]) => { setHighlightTubes(new Set(ids)); setActiveTab('canvas'); }} />;
+      case 'decision': return <DecisionSystem unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
       case 'import': return <DataImport unitId={selectedUnitId} />;
-      default: return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} onClearHighlight={() => setHighlightTubes(null)} />;
+      default: return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
     }
   };
 

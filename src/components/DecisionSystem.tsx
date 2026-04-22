@@ -4,7 +4,7 @@ import * as XLSX from 'xlsx';
 
 interface DecisionSystemProps {
   unitData: any;
-  onApplyToVisual?: (ids: string[]) => void;
+  onApplyToVisual?: (ids: string[], sourceYear: number, baseYear: number) => void;
 }
 
 interface Rule {
@@ -127,19 +127,20 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
         let isPlugged = r.code === 'PLG';
         let isReplaced = false;
         let depth = Number(r.size_val) || 0;
-        const code = r.code || 'NDD';
+        let code = r.code || 'NDD';
 
         if (mode === 'after') {
           const mainAction = maintenanceRes.find(m => m.zone === r.zone && m.row_num === r.row_num && m.col_num === r.col_num);
           if (mainAction) {
-            if (mainAction.action === 'PLG') {
+            if (mainAction.action === 'PLG' || mainAction.action === '塞管') {
               isPlugged = true;
-            } else if (mainAction.action === 'RPL') {
+            } else if (mainAction.action === 'RPL' || mainAction.action === '換管') {
               isPlugged = false;
               isReplaced = true;
               depth = 0;
+              code = 'NDD';
             }
-          } else {
+          } else if (maintenanceRes.length === 0) {
             if (depth > 50) isPlugged = true;
             if (code === 'COR') isPlugged = true;
           }
@@ -500,7 +501,11 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
             <div className="flex items-center gap-3">
               {onApplyToVisual && (
                 <button
-                  onClick={() => onApplyToVisual(suggestedList.map(item => item.id))}
+                  onClick={() => {
+                    const [sourceYearStr] = currentSelection.split('-');
+                    const [baseYearStr] = previousSelection.split('-');
+                    onApplyToVisual(suggestedList.map(item => item.id), Number(sourceYearStr), Number(baseYearStr));
+                  }}
                   disabled={suggestedList.length === 0}
                   className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
                   title="將結果套用至動態視覺檢視的畫布上"

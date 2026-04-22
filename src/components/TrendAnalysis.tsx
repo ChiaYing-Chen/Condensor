@@ -1,12 +1,12 @@
 import React, { useMemo, useState, useEffect } from 'react';
-import { Download, TrendingUp, AlertCircle, Loader2, CheckCircle2, ShieldAlert } from 'lucide-react';
+import { Download, TrendingUp, AlertCircle, Loader2, CheckCircle2, ShieldAlert, HelpCircle, Info } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
 interface TrendAnalysisProps {
   unitData: any;
 }
 
-const ZONES = ['IL', 'IR', 'OL', 'OR'];
+const ZONES = ['ALL', 'IL', 'IR', 'OL', 'OR'];
 
 const DIST_BUCKETS = [
   { label: '減少 0~14.9%',          color: 'text-purple-400',  bg: 'bg-purple-900/30',  test: (r: number) => r < 0 && r > -15 },
@@ -23,6 +23,7 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
   const [maintenanceYears, setMaintenanceYears] = useState<number[]>([]);
   const [loading, setLoading] = useState(false);
   const [deltaData, setDeltaData] = useState<any[]>([]);
+  const [showHelp, setShowHelp] = useState(false);
 
   useEffect(() => {
     if (!unitData || !unitData.unit_id) return;
@@ -38,7 +39,10 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
           setMaintenanceYears(availableMainYears);
           const defaultCurrMode = availableMainYears.includes(sorted[0]) ? 'after' : 'before';
           setCurrentSelection(`${sorted[0]}-${defaultCurrMode}`);
-          setPreviousSelection(sorted.length > 1 ? `${sorted[1]}-before` : `${sorted[0]}-before`);
+          
+          let prevYear = sorted.length > 1 ? sorted[1] : sorted[0];
+          const defaultPrevMode = availableMainYears.includes(prevYear) ? 'after' : 'before';
+          setPreviousSelection(`${prevYear}-${defaultPrevMode}`);
         } else {
           setAvailableYears([]); setMaintenanceYears([]);
           setCurrentSelection(''); setPreviousSelection(''); setDeltaData([]);
@@ -61,13 +65,13 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
         let isPlugged = r.code === 'PLG';
         let isReplaced = false;
         let depth = Number(r.size_val) || 0;
-        const code = r.code || 'NDD';
+        let code = r.code || 'NDD';
         if (mode === 'after') {
           const mainAction = maintenanceRes.find(m => m.zone === r.zone && m.row_num === r.row_num && m.col_num === r.col_num);
           if (mainAction) {
-            if (mainAction.action === 'PLG') { isPlugged = true; }
-            else if (mainAction.action === 'RPL') { isPlugged = false; isReplaced = true; depth = 0; }
-          } else {
+            if (mainAction.action === 'PLG' || mainAction.action === '塞管') { isPlugged = true; }
+            else if (mainAction.action === 'RPL' || mainAction.action === '換管') { isPlugged = false; isReplaced = true; depth = 0; code = 'NDD'; }
+          } else if (maintenanceRes.length === 0) {
             if (depth > 50) isPlugged = true;
             if (code === 'COR') isPlugged = true;
           }
@@ -137,7 +141,7 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
   // 計算每個象限的統計資料
   const zoneStats = useMemo(() => {
     return ZONES.map(zone => {
-      const zoneData = deltaData.filter(d => d.quadrant === zone);
+      const zoneData = zone === 'ALL' ? deltaData : deltaData.filter(d => d.quadrant === zone);
       const normalData = zoneData.filter(d => !d.isAnomaly);
 
       const dist = DIST_BUCKETS.map(b => ({
@@ -247,8 +251,8 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
       {/* Header */}
       <div className="flex justify-between items-end">
         <div>
-          <h2 className="text-2xl font-bold text-white">瑕疵深度比對 (Trend Analysis)</h2>
-          <p className="text-slate-400">差異比對 (Delta View) 與象限分布統計</p>
+          <h2 className="text-2xl font-bold text-white">瑕疵深度比對 (Delta Analysis)</h2>
+          <p className="text-slate-400 mt-1">差異比對與象限分布統計</p>
         </div>
         <div className="flex items-center gap-3">
           <button
@@ -278,29 +282,77 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
             <Loader2 className="animate-spin text-blue-500" size={32} />
           </div>
         )}
-        <div className="flex items-center gap-6">
-          <YearSelector label="本次比對狀態:" value={currentSelection} onChange={setCurrentSelection} />
-          <div className="text-slate-500 font-bold px-4 py-1 bg-slate-800/50 rounded-lg">VS</div>
-          <YearSelector label="基準比對狀態:" value={previousSelection} onChange={setPreviousSelection} />
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-6">
+            <YearSelector label="本次比對狀態:" value={currentSelection} onChange={setCurrentSelection} />
+            <div className="text-slate-500 font-bold px-4 py-1 bg-slate-800/50 rounded-lg">VS</div>
+            <YearSelector label="基準比對狀態:" value={previousSelection} onChange={setPreviousSelection} />
+          </div>
+          
+          <button 
+            onClick={() => setShowHelp(!showHelp)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold transition-all duration-200 shadow-sm ${
+              showHelp 
+                ? 'bg-blue-600 text-white shadow-blue-900/50' 
+                : 'bg-blue-500/20 text-blue-400 border border-blue-500/40 hover:bg-blue-500/30 hover:border-blue-500/60 hover:text-blue-300'
+            }`}
+            title="查看比對模式說明"
+          >
+            <HelpCircle size={18} />
+            <span>比對模式說明</span>
+          </button>
         </div>
       </div>
 
+      {/* Help Card */}
+      {showHelp && (
+        <div className="bg-blue-900/20 border border-blue-800/60 rounded-xl p-4 text-blue-100 flex items-start gap-3 animate-in fade-in slide-in-from-top-2">
+          <Info className="w-5 h-5 mt-0.5 text-blue-400 flex-shrink-0" />
+          <div className="space-y-2 text-sm leading-relaxed">
+            <p className="font-bold text-blue-300 text-base">比對模式意義說明</p>
+            <ul className="list-disc pl-5 space-y-2">
+              <li>
+                <span className="font-semibold text-blue-200">跨年運轉比對（本次「大修檢測基準」 VS 前次「大修處置後」）：</span>
+                <br />
+                代表 <span className="text-white bg-blue-900/40 px-1 rounded">上次大修起機後，到本次大修停機檢測期間</span> 設備因為實際運轉所產生的管束劣化差異。
+              </li>
+              <li>
+                <span className="font-semibold text-blue-200">同年維修比對（同年「大修處置後」 VS 同年「大修檢測基準」）：</span>
+                <br />
+                代表 <span className="text-white bg-blue-900/40 px-1 rounded">本次大修期間所執行的實際維修成果</span>。
+                在此模式下：
+                <ul className="list-[circle] pl-5 mt-1 text-blue-200/80 space-y-0.5">
+                  <li>「突現塞管」的數量：即等於本次維修的 <strong>塞管數量</strong>。</li>
+                  <li>「減少 0~14.9%」加上「瑕疵率異常降低 (≥15%)」的總和：即等於本次維修的 <strong>換管數量</strong>。</li>
+                </ul>
+              </li>
+            </ul>
+          </div>
+        </div>
+      )}
+
       {/* Zone Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-4">
         {zoneStats.map(({ zone, dist, missingPlug, suddenPlug, abnormalDecrease, totalAnomalies: zoneAnomaly, total }) => (
           <div
             key={zone}
-            className={`bg-slate-900 rounded-xl border ${zoneAnomaly > 0 ? 'border-orange-900/60' : 'border-slate-800'} p-4 flex flex-col gap-3`}
+            className={`bg-slate-900 rounded-xl ${
+              zone === 'ALL'
+                ? 'border-2 border-blue-700/60 shadow-[0_0_15px_rgba(59,130,246,0.15)]'
+                : `border ${zoneAnomaly > 0 ? 'border-orange-900/60' : 'border-slate-800'}`
+            } p-4 flex flex-col gap-3`}
           >
             {/* Zone Header */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="text-lg font-bold text-white bg-slate-800 px-3 py-1 rounded-lg">{zone}</span>
-                <span className="text-xs text-slate-500">共 {total} 支</span>
+            <div className="flex items-start justify-between gap-1">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className={`${zone === 'ALL' ? 'text-base' : 'text-lg'} font-bold text-white px-2 py-0.5 rounded-lg whitespace-nowrap ${zone === 'ALL' ? 'bg-blue-900 border border-blue-700 shadow-[0_0_10px_rgba(59,130,246,0.3)]' : 'bg-slate-800'}`}>
+                  {zone === 'ALL' ? '合計' : zone}
+                </span>
+                <span className="text-[10px] text-slate-500 whitespace-nowrap">共 {total} 支</span>
               </div>
               {zoneAnomaly > 0 && (
-                <span className="flex items-center gap-1 text-xs text-orange-400 font-bold bg-orange-900/30 px-2 py-1 rounded-md border border-orange-900/40">
-                  <AlertCircle size={12} /> {zoneAnomaly} 異常
+                <span className="flex items-center gap-0.5 text-[10px] text-orange-400 font-bold bg-orange-900/30 px-1.5 py-0.5 rounded-md border border-orange-900/40 whitespace-nowrap flex-shrink-0">
+                  <AlertCircle size={10} /> {zoneAnomaly} 異常
                 </span>
               )}
             </div>

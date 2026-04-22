@@ -353,24 +353,37 @@ app.post('/api/maintenance/upload', async (req, res) => {
       const notes = notesKey ? row[notesKey] : null;
 
       if (zone && !isNaN(row_num) && !isNaN(col_num) && action) {
+        let act = action.trim().toUpperCase();
+        if (act === '換管') act = 'RPL';
+        if (act === '塞管') act = 'PLG';
+
         await pool.query(
           `INSERT INTO maintenance_actions (unit_id, year, zone, row_num, col_num, action, new_material, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [uid, targetYear, zone.trim(), row_num, col_num, action.trim(), new_material, notes]
+          [uid, targetYear, zone.trim(), row_num, col_num, act, new_material, notes]
         );
 
         // 如果是換管 (RPL)，更新 tube_registry 的材質與安裝年份
-        if (action.trim() === 'RPL' && new_material) {
-          await pool.query(
-            `UPDATE tube_registry 
-             SET material = $1, install_year = $2, status = 'active', updated_at = NOW()
-             WHERE unit_id = $3 AND zone = $4 AND row_num = $5 AND col_num = $6`,
-            [new_material.trim(), targetYear, uid, zone.trim(), row_num, col_num]
-          );
+        if (act === 'RPL') {
+          if (new_material) {
+            await pool.query(
+              `UPDATE tube_registry 
+               SET material = $1, install_year = $2, status = 'active', updated_at = NOW()
+               WHERE unit_id = $3 AND zone = $4 AND row_num = $5 AND col_num = $6`,
+              [new_material.trim(), targetYear, uid, zone.trim(), row_num, col_num]
+            );
+          } else {
+            await pool.query(
+              `UPDATE tube_registry 
+               SET install_year = $1, status = 'active', updated_at = NOW()
+               WHERE unit_id = $2 AND zone = $3 AND row_num = $4 AND col_num = $5`,
+              [targetYear, uid, zone.trim(), row_num, col_num]
+            );
+          }
         }
 
         // 如果是塞管 (PLG)，更新 tube_registry 狀態
-        if (action.trim() === 'PLG') {
+        if (act === 'PLG') {
           await pool.query(
             `UPDATE tube_registry 
              SET status = 'plugged', updated_at = NOW()

@@ -70,10 +70,14 @@ type ViewMode = 'before' | 'after';
 interface TubeSheetCanvasProps {
   unitId: string;
   highlightTubes?: Set<string> | null;
+  /** 由處置篩選系統傳入：本次篩選的目標年份，用於時間軸閃爍定位 */
+  filterSourceYear?: number | null;
+  /** 由處置篩選系統傳入：基準比對年份，用於時間軸閃爍定位 */
+  filterBaseYear?: number | null;
   onClearHighlight?: () => void;
 }
 
-export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlight }: TubeSheetCanvasProps) {
+export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYear, filterBaseYear, onClearHighlight }: TubeSheetCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [availableYears, setAvailableYears] = useState<number[]>([]);
   const [currentYearIndex, setCurrentYearIndex] = useState(0);
@@ -137,6 +141,8 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
 
     setLoading(true);
     setCurrentYearIndex(0);
+    setPlayStepIndex(0);
+    setViewMode('before');
     setAvailableYears([]);
     setIsPlaying(false);
 
@@ -145,16 +151,28 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
       fetch(`${import.meta.env.BASE_URL}api/tubes?unit_id=${unitId}`).then(res => res.json()),
       fetch(`${import.meta.env.BASE_URL}api/maintenance/years?unit_id=${unitId}`).then(res => res.json())
     ]).then(([years, tubesRegistry, mainYears]) => {
+      let sortedYears: number[] = [];
       if (Array.isArray(years)) {
-        const sorted = years.sort((a,b) => a - b);
-        setAvailableYears(sorted);
-        if (sorted.length > 0) {
-          setCurrentYearIndex(sorted.length - 1); // Latest year
-        }
+        sortedYears = years.sort((a,b) => a - b);
+        setAvailableYears(sortedYears);
       }
       
+      let mYears: number[] = [];
       if (Array.isArray(mainYears)) {
-        setMaintenanceYears(mainYears);
+        mYears = mainYears;
+        setMaintenanceYears(mYears);
+      }
+      
+      if (sortedYears.length > 0) {
+        let totalSteps = sortedYears.length;
+        mYears.forEach(y => { if (sortedYears.includes(y)) totalSteps++; });
+        
+        const lastYear = sortedYears[sortedYears.length - 1];
+        const hasMaint = mYears.includes(lastYear);
+
+        setPlayStepIndex(totalSteps - 1);
+        setCurrentYearIndex(sortedYears.length - 1);
+        setViewMode(hasMaint ? 'after' : 'before');
       }
       
       const regMap: Record<string, any> = {};
@@ -378,7 +396,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
 
       const record = yearRecords[tube.id];
       const maintenance = maintenanceRecords[tube.id];
-      const code = record?.code || '';
+      let code = record?.code || '';
 
       let color = '#334155'; // default empty
       let isBlink = false;
@@ -391,11 +409,12 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
 
         if (viewMode === 'after') {
           if (maintenance) {
-            if (maintenance.action === 'PLG') {
+            if (maintenance.action === 'PLG' || maintenance.action === '塞管') {
               isPlugged = true;
-            } else if (maintenance.action === 'RPL') {
+            } else if (maintenance.action === 'RPL' || maintenance.action === '換管') {
               isPlugged = false;
               depth = 0;
+              code = 'NDD';
             }
           } else {
             if (depth > 50) isPlugged = true;
@@ -1219,13 +1238,35 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
           {/* 時間軸：每個 playStep 一個節點 */}
           <div className="flex-1 px-4">
             <div className="relative flex items-center justify-between">
-              <div className="absolute left-0 right-0 h-1 bg-slate-800 rounded-full top-[8px] z-0"></div>
-              
+              {/* 底線：若有未來預期點則向右延伸 */}
+              <div className={`absolute left-0 h-1 bg-slate-800 rounded-full top-[8px] z-0 ${
+                filterSourceYear && !maintenanceYears.includes(filterSourceYear) ? 'right-0' : 'right-0'
+              }`}></div>
+
               {playSteps.map((step, si) => {
                 const year = availableYears[step.yi];
                 const isActive = si === playStepIndex;
                 const isPast = si < playStepIndex;
                 const isBefore = step.vm === 'before';
+
+                // ── 情境 B：時間軸上已存在該年份 → 在對應步驟的圓點加閃爍外圈
+                // 本次比對年份(amber) 與 基準比對年份(violet) 分別標記
+                const isSourceTarget =
+                  filterSourceYear != null &&
+                  highlightTubes != null &&
+                  highlightTubes.size > 0 &&
+                  year === filterSourceYear &&
+                  availableYears.includes(filterSourceYear);
+
+                const isBaseTarget =
+                  filterBaseYear != null &&
+                  highlightTubes != null &&
+                  highlightTubes.size > 0 &&
+                  year === filterBaseYear &&
+                  availableYears.includes(filterBaseYear);
+
+                const isFilterTarget = isSourceTarget || isBaseTarget;
+
                 return (
                   <div
                     key={`${year}-${step.vm}`}
@@ -1237,13 +1278,29 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
                       setViewMode(step.vm);
                     }}
                   >
+                    {/* 情境 B：閃爍漣漪外圈（本次比對 amber，基準比對 violet） */}
+                    {isSourceTarget && (
+                      <>
+                        <div className="absolute w-7 h-7 rounded-full bg-amber-400/40 animate-ping top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-0" />
+                        <div className="absolute w-6 h-6 rounded-full border-2 border-amber-400 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-0 opacity-80" />
+                      </>
+                    )}
+                    {isBaseTarget && (
+                      <>
+                        <div className="absolute w-7 h-7 rounded-full bg-violet-400/40 animate-ping top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-0" />
+                        <div className="absolute w-6 h-6 rounded-full border-2 border-violet-400 top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-0 opacity-80" />
+                      </>
+                    )}
                     {/* 節點圓點：before=藍，after=綠 */}
-                    <div className={`w-4 h-4 rounded-full border-2 transition-all duration-200 ${
+                    <div className={`relative z-10 w-4 h-4 rounded-full border-2 transition-all duration-200 ${
                       isActive
                         ? (isBefore ? 'bg-blue-500 border-blue-400 scale-125 shadow-[0_0_8px_rgba(59,130,246,0.7)]' : 'bg-emerald-500 border-emerald-400 scale-125 shadow-[0_0_8px_rgba(16,185,129,0.7)]')
                         : isPast
                           ? (isBefore ? 'bg-blue-900 border-blue-700' : 'bg-emerald-900 border-emerald-700')
                           : 'bg-slate-800 border-slate-600 group-hover:border-blue-500'
+                    } ${
+                      isSourceTarget ? 'shadow-[0_0_10px_rgba(251,191,36,0.8)]' :
+                      isBaseTarget  ? 'shadow-[0_0_10px_rgba(167,139,250,0.8)]' : ''
                     }`}></div>
                     {/* 標籤：年份（before 才顯示）+ 檢測/處置 */}
                     <div className="absolute top-6 flex flex-col items-center gap-0.5">
@@ -1265,7 +1322,51 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, onClearHighlig
                   </div>
                 );
               })}
-              
+
+              {/* ── 情境 A：時間軸上不存在的年份 → 末端顯示預期閃爍點 */}
+              {(() => {
+                if (!highlightTubes || highlightTubes.size === 0) return null;
+                // 收集兩個比較年份中，時間軸上不存在的年份
+                const futureYears: Array<{ year: number; isSource: boolean }> = [];
+                if (filterSourceYear != null && !availableYears.includes(filterSourceYear)) {
+                  futureYears.push({ year: filterSourceYear, isSource: true });
+                }
+                if (filterBaseYear != null && !availableYears.includes(filterBaseYear) &&
+                    filterBaseYear !== filterSourceYear) {
+                  futureYears.push({ year: filterBaseYear, isSource: false });
+                }
+                if (futureYears.length === 0) return null;
+                return futureYears.map(({ year, isSource }) => (
+                  <div key={`future-${year}`} className="relative z-10 flex flex-col items-center ml-6">
+                    <div className="relative w-5 h-5 flex items-center justify-center">
+                      <div className={`absolute inset-0 rounded-full animate-ping opacity-60 ${
+                        isSource ? 'bg-amber-400' : 'bg-violet-400'
+                      }`} />
+                      <div className={`absolute inset-0 rounded-full animate-ping opacity-40 ${
+                        isSource ? 'bg-amber-500/30' : 'bg-violet-500/30'
+                      }`} style={{ animationDelay: '0.25s' }} />
+                      <div className={`relative w-4 h-4 rounded-full border-2 border-dashed z-10 ${
+                        isSource
+                          ? 'bg-amber-500 border-amber-300 shadow-[0_0_12px_rgba(251,191,36,0.9)]'
+                          : 'bg-violet-500 border-violet-300 shadow-[0_0_12px_rgba(167,139,250,0.9)]'
+                      }`} />
+                    </div>
+                    <div className="absolute top-7 flex flex-col items-center gap-0.5 pointer-events-none">
+                      <span className={`text-xs font-bold whitespace-nowrap ${
+                        isSource ? 'text-amber-300' : 'text-violet-300'
+                      }`}>{year}</span>
+                      <span className={`text-[10px] whitespace-nowrap px-1.5 py-0.5 rounded-full border ${
+                        isSource
+                          ? 'text-amber-400/90 bg-amber-900/30 border-amber-700/40'
+                          : 'text-violet-400/90 bg-violet-900/30 border-violet-700/40'
+                      }`}>
+                        {isSource ? '預期大修檢測' : '預期基準年份'}
+                      </span>
+                    </div>
+                  </div>
+                ));
+              })()}
+
               {playSteps.length === 0 && (
                 <div className="text-slate-500 text-sm italic py-2">無歷史年份資料，請先匯入</div>
               )}
