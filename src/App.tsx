@@ -57,7 +57,7 @@ export default function App() {
     switch (activeTab) {
       case 'dashboard': return <Dashboard unitData={currentUnit} />;
       case 'canvas': return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
-      case 'trend': return <TrendAnalysis unitData={currentUnit} />;
+      case 'trend': return <TrendAnalysis unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
       case 'decision': return <DecisionSystem unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
       case 'import': return <DataImport unitId={selectedUnitId} />;
       default: return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;

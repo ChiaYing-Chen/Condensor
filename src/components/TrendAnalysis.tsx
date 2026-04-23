@@ -1,9 +1,10 @@
 import React, { useMemo, useState, useEffect } from 'react';
-import { Download, TrendingUp, AlertCircle, Loader2, CheckCircle2, ShieldAlert, HelpCircle, Info } from 'lucide-react';
+import { Download, TrendingUp, AlertCircle, Loader2, CheckCircle2, ShieldAlert, HelpCircle, Info, Eye } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
 interface TrendAnalysisProps {
   unitData: any;
+  onApplyToVisual?: (ids: string[], sourceYear: number, baseYear: number) => void;
 }
 
 const ZONES = ['ALL', 'IL', 'IR', 'OL', 'OR'];
@@ -16,7 +17,7 @@ const DIST_BUCKETS = [
   { label: '成長 >40%',              color: 'text-red-400',     bg: 'bg-red-900/20',     test: (r: number) => r > 40 },
 ];
 
-export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
+export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalysisProps) {
   const [availableYears, setAvailableYears] = useState<number[]>([]);
   const [currentSelection, setCurrentSelection] = useState<string>('');
   const [previousSelection, setPreviousSelection] = useState<string>('');
@@ -202,6 +203,14 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
     XLSX.writeFile(wb, `Condenser_Anomaly_${previousSelection}_to_${currentSelection}.xlsx`);
   };
 
+  const handleViewInCanvas = () => {
+    if (!onApplyToVisual || totalAnomalies === 0) return;
+    const anomalyIds = deltaData.filter(d => d.isAnomaly || d.anomalyType === 'abnormal_decrease').map(d => d.id);
+    const [currentYear] = currentSelection.split('-');
+    const [prevYear] = previousSelection.split('-');
+    onApplyToVisual(anomalyIds, Number(currentYear), Number(prevYear));
+  };
+
   if (availableYears.length < 2) {
     return (
       <div className="flex flex-col items-center justify-center p-12 bg-slate-900 rounded-xl border border-slate-800 text-slate-400">
@@ -255,6 +264,17 @@ export default function TrendAnalysis({ unitData }: TrendAnalysisProps) {
           <p className="text-slate-400 mt-1">差異比對與象限分布統計</p>
         </div>
         <div className="flex items-center gap-3">
+          {onApplyToVisual && (
+            <button
+              onClick={handleViewInCanvas}
+              disabled={totalAnomalies === 0 || loading}
+              title={totalAnomalies === 0 ? '目前無異常記錄' : '在動態視覺檢視中凸顯異常管束'}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Eye size={16} />
+              <span>在視覺中凸顯 ({totalAnomalies})</span>
+            </button>
+          )}
           <button
             onClick={handleExportAnomalies}
             disabled={totalAnomalies === 0 || loading}

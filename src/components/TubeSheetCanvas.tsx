@@ -416,7 +416,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
               depth = 0;
               code = 'NDD';
             }
-          } else {
+          } else if (Object.keys(maintenanceRecords).length === 0) {
             if (depth > 50) isPlugged = true;
             if (code === 'COR') isPlugged = true;
           }
