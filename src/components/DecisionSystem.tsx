@@ -33,8 +33,8 @@ const evaluateRule = (formula: string, context: any) => {
 };
 
 const DEFAULT_RULES: Rule[] = [
-  { id: '1', formula: 'TubeAge >= 6 and depth_Diff > 30 and this_depth >= 40', enabled: true },
-  { id: '2', formula: 'TubeAge >= 6 and depth_Diff > 35', enabled: true },
+  { id: '1', formula: 'depth_Diff > 30 and this_depth >= 40', enabled: true },
+  { id: '2', formula: 'depth_Diff > 35', enabled: true },
   { id: '3', formula: 'this_depth > 50', enabled: true },
   { id: '4', formula: 'Code = "COR"', enabled: true },
 ];

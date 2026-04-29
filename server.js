@@ -158,6 +158,56 @@ app.get('/api/years', async (req, res) => {
   }
 });
 
+app.get('/api/max_plugged', async (req, res) => {
+  const unit_id = req.query.unit_id || 'TG-1';
+  try {
+    const result = await pool.query(`
+      WITH maint_years AS (
+        SELECT DISTINCT year FROM maintenance_actions WHERE unit_id = $1
+      ),
+      raw_data AS (
+        SELECT 
+          i.year,
+          i.code as inspect_code,
+          i.size_val,
+          m.action as maint_action
+        FROM inspection_records i
+        LEFT JOIN maintenance_actions m 
+          ON i.unit_id = m.unit_id AND i.year = m.year 
+          AND i.zone = m.zone AND i.row_num = m.row_num AND i.col_num = m.col_num
+        WHERE i.unit_id = $1
+      ),
+      yearly_summary AS (
+        SELECT r.year,
+          SUM(CASE WHEN inspect_code = 'PLG' THEN 1 ELSE 0 END) as before_plugged,
+          SUM(CASE 
+            WHEN my.year IS NOT NULL THEN
+               CASE 
+                 WHEN maint_action IN ('PLG', '塞管') THEN 1
+                 WHEN maint_action IN ('RPL', '換管') THEN 0
+                 WHEN inspect_code = 'PLG' THEN 1
+                 ELSE 0
+               END
+            ELSE
+               CASE
+                 WHEN inspect_code = 'PLG' THEN 1
+                 WHEN size_val > 50 THEN 1
+                 WHEN inspect_code = 'COR' THEN 1
+                 ELSE 0
+               END
+          END) as after_plugged
+        FROM raw_data r
+        LEFT JOIN maint_years my ON r.year = my.year
+        GROUP BY r.year
+      )
+      SELECT GREATEST(COALESCE(MAX(before_plugged), 0), COALESCE(MAX(after_plugged), 0)) as max_plugged FROM yearly_summary;
+    `, [unit_id]);
+    res.json({ max_plugged: parseInt(result.rows[0]?.max_plugged || 0, 10) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 取得特定機組的可用維護紀錄年份
 app.get('/api/maintenance/years', async (req, res) => {
   const unit_id = req.query.unit_id || 'TG-1';
@@ -199,31 +249,32 @@ app.post('/api/records/upload', async (req, res) => {
     return res.status(400).json({ error: 'No records provided' });
   }
 
-  // 從第一筆紀錄取得年份
-  let rawYear = null;
+  // 從資料中提取所有涵蓋的年份
+  const targetYearsSet = new Set();
   for (const r of records) {
-    if (r['年份'] || r['Year'] || r['year']) {
-      rawYear = r['年份'] || r['Year'] || r['year'];
-      break;
+    const rawYear = r['年份'] || r['Year'] || r['year'];
+    if (rawYear !== undefined && rawYear !== null && rawYear !== '') {
+      const yNorm = normalizeYear(rawYear);
+      if (yNorm) targetYearsSet.add(yNorm);
     }
   }
 
-  const targetYear = normalizeYear(rawYear);
-  if (!targetYear) {
+  const targetYears = Array.from(targetYearsSet);
+  if (targetYears.length === 0) {
     return res.status(400).json({ error: 'Unable to parse year from records' });
   }
 
   try {
     // 檢查此年份是否已有資料
     const checkResult = await pool.query(
-      'SELECT COUNT(*) FROM inspection_records WHERE unit_id = $1 AND year = $2',
-      [uid, targetYear]
+      'SELECT DISTINCT year FROM inspection_records WHERE unit_id = $1 AND year = ANY($2::int[])',
+      [uid, targetYears]
     );
-    const exists = parseInt(checkResult.rows[0].count, 10) > 0;
+    const exists = checkResult.rows.length > 0;
 
     if (exists) {
       if (!password || password !== OVERWRITE_PASSWORD) {
-        return res.status(403).json({ error: '此年份的資料已存在，覆寫需要密碼', requirePassword: true });
+        return res.status(403).json({ error: '部分年份的資料已存在，覆寫需要密碼', requirePassword: true });
       }
     }
 
@@ -231,17 +282,21 @@ app.post('/api/records/upload', async (req, res) => {
 
     if (exists) {
       await pool.query(
-        'DELETE FROM inspection_records WHERE unit_id = $1 AND year = $2',
-        [uid, targetYear]
+        'DELETE FROM inspection_records WHERE unit_id = $1 AND year = ANY($2::int[])',
+        [uid, targetYears]
       );
     }
 
     const insertQuery = `
-      INSERT INTO inspection_records (unit_id, year, zone, row_num, col_num, channel, code, size_val)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO inspection_records (unit_id, year, zone, row_num, col_num, channel, code, size_val, notes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     `;
 
     for (const row of records) {
+      const rawYear = row['年份'] || row['Year'] || row['year'];
+      const targetYear = normalizeYear(rawYear);
+      if (!targetYear) continue;
+
       const keys = Object.keys(row);
       const zoneKey = keys.find(k => k.includes('區域') || k.toLowerCase().includes('zone'));
       const rowKey  = keys.find(k => k.includes('行') || k.toLowerCase().includes('row'));
@@ -249,6 +304,7 @@ app.post('/api/records/upload', async (req, res) => {
       const channelKey = keys.find(k => k.includes('頻道') || k.toLowerCase().includes('channel'));
       const codeKey = keys.find(k => k.includes('瑕疵') || k.toLowerCase().includes('code'));
       const sizeKey = keys.find(k => k.includes('深度') || k.toLowerCase().includes('size'));
+      const notesKey = keys.find(k => k.includes('備註') || k.toLowerCase().includes('notes'));
 
       const zone = zoneKey ? row[zoneKey] : null;
       const row_num = rowKey ? row[rowKey] : null;
@@ -256,6 +312,7 @@ app.post('/api/records/upload', async (req, res) => {
       const channel = channelKey ? row[channelKey] : null;
       const code = codeKey ? row[codeKey] : 'NDD';
       const size_val = sizeKey ? row[sizeKey] : 0;
+      const notes = notesKey ? row[notesKey] : null;
 
       if (zone && row_num && col_num) {
         await pool.query(insertQuery, [
@@ -266,13 +323,14 @@ app.post('/api/records/upload', async (req, res) => {
           parseInt(col_num, 10),
           channel ? channel.trim() : null,
           code ? code.trim() : 'NDD',
-          parseFloat(size_val) || 0
+          parseFloat(size_val) || 0,
+          notes ? notes.trim() : null
         ]);
       }
     }
 
     await pool.query('COMMIT');
-    res.json({ success: true, message: `成功儲存 ${uid} 年份 ${targetYear} 的資料` });
+    res.json({ success: true, message: `成功儲存 ${uid} 共 ${targetYears.length} 個年份的資料 (${targetYears.join(', ')})` });
 
   } catch (error) {
     await pool.query('ROLLBACK');
@@ -303,27 +361,38 @@ app.get('/api/maintenance', async (req, res) => {
 
 // 上傳處置紀錄（覆寫需密碼）
 app.post('/api/maintenance/upload', async (req, res) => {
-  const { password, records, unit_id, year } = req.body;
+  const { password, records, unit_id } = req.body;
   const uid = unit_id || 'TG-1';
-  const targetYear = normalizeYear(year);
 
-  if (!targetYear) {
-    return res.status(400).json({ error: 'Missing or invalid year' });
-  }
   if (!records || !Array.isArray(records) || records.length === 0) {
     return res.status(400).json({ error: 'No records provided' });
   }
 
+  // 從資料中提取所有涵蓋的年份
+  const targetYearsSet = new Set();
+  for (const r of records) {
+    const rawYear = r['年份'] || r['Year'] || r['year'];
+    if (rawYear !== undefined && rawYear !== null && rawYear !== '') {
+      const yNorm = normalizeYear(rawYear);
+      if (yNorm) targetYearsSet.add(yNorm);
+    }
+  }
+
+  const targetYears = Array.from(targetYearsSet);
+  if (targetYears.length === 0) {
+    return res.status(400).json({ error: 'Missing or invalid year in records' });
+  }
+
   try {
     const checkResult = await pool.query(
-      'SELECT COUNT(*) FROM maintenance_actions WHERE unit_id = $1 AND year = $2',
-      [uid, targetYear]
+      'SELECT DISTINCT year FROM maintenance_actions WHERE unit_id = $1 AND year = ANY($2::int[])',
+      [uid, targetYears]
     );
-    const exists = parseInt(checkResult.rows[0].count, 10) > 0;
+    const exists = checkResult.rows.length > 0;
 
     if (exists) {
       if (!password || password !== OVERWRITE_PASSWORD) {
-        return res.status(403).json({ error: '此年份的處置資料已存在，覆寫需要密碼', requirePassword: true });
+        return res.status(403).json({ error: '部分年份的處置資料已存在，覆寫需要密碼', requirePassword: true });
       }
     }
 
@@ -331,12 +400,16 @@ app.post('/api/maintenance/upload', async (req, res) => {
 
     if (exists) {
       await pool.query(
-        'DELETE FROM maintenance_actions WHERE unit_id = $1 AND year = $2',
-        [uid, targetYear]
+        'DELETE FROM maintenance_actions WHERE unit_id = $1 AND year = ANY($2::int[])',
+        [uid, targetYears]
       );
     }
 
     for (const row of records) {
+      const rawYear = row['年份'] || row['Year'] || row['year'];
+      const targetYear = normalizeYear(rawYear);
+      if (!targetYear) continue;
+
       const keys = Object.keys(row);
       const zoneKey = keys.find(k => k.includes('區域') || k.toLowerCase().includes('zone'));
       const rowKey  = keys.find(k => k.includes('行') || k.toLowerCase().includes('row'));
@@ -395,7 +468,7 @@ app.post('/api/maintenance/upload', async (req, res) => {
     }
 
     await pool.query('COMMIT');
-    res.json({ success: true, message: `成功儲存 ${uid} 年份 ${targetYear} 的處置結果` });
+    res.json({ success: true, message: `成功儲存 ${uid} 共 ${targetYears.length} 個年份的處置結果 (${targetYears.join(', ')})` });
 
   } catch (error) {
     await pool.query('ROLLBACK');

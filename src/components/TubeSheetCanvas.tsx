@@ -104,6 +104,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   // 處置顏色視覺功能
   const [showDisposalColors, setShowDisposalColors] = useState(false);
   const [showOldPlugs, setShowOldPlugs] = useState(false);
+  const [showDNTOnly, setShowDNTOnly] = useState(false);
   // 快速上傳 Modal
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<'idle'|'uploading'|'success'|'error'|'password_required'>('idle');
@@ -484,12 +485,29 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
         }
       }
 
+      const isDNTTube = record && (code === 'DNT' || (record.notes && record.notes.includes('DNT')));
+
+      if (showDNTOnly) {
+        let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : true;
+        if (isDNTTube && isHighlighted) {
+          isBlink = true;
+        } else {
+          color = isPrintMode ? '#e2e8f0' : '#1e293b';
+          isBlink = false;
+          isOldPlug = false;
+        }
+      }
+
       // 閃爍定律：這幀 frame 若是隱居相則不畫
       if (isBlink && !blinkVisible) return;
 
       if (record && code === 'DNT') {
           let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : false;
-          if (highlightTubes && !isHighlighted) {
+          let isMuted = false;
+          if (highlightTubes && !isHighlighted) isMuted = true;
+          if (showDNTOnly && !(isDNTTube && (!highlightTubes || isHighlighted))) isMuted = true;
+
+          if (isMuted) {
             // 在篩選強調節點模式中且未被強調，畫為一般黯淡灰圈 或 網格線
             ctx.fillStyle = (showGridMarkers && tube.col % 5 === 0) 
               ? (isPrintMode ? '#3b82f6' : '#cbd5e1') 
@@ -581,7 +599,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tubes, quadrantFilter, yearRecords, maintenanceRecords, registryRecords, hoveredTube, viewMode, highlightTubes, showGridMarkers, showDisposalColors, showOldPlugs]);
+  }, [tubes, quadrantFilter, yearRecords, maintenanceRecords, registryRecords, hoveredTube, viewMode, highlightTubes, showGridMarkers, showDisposalColors, showOldPlugs, showDNTOnly]);
 
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1167,12 +1185,18 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
             <LegendItem color="bg-pink-500" label="COR 氨腐蝕" animate />
             <LegendItem color="bg-white" label="BLK/RST 無法檢測" animate />
             <LegendItem color="bg-blue-600" label="OBS 待觀察" animate />
-            <div className="flex items-center gap-1.5">
+            <button 
+              onClick={() => setShowDNTOnly(prev => !prev)}
+              className={`flex items-center gap-1.5 px-2 py-1 -ml-2 rounded transition-colors ${
+                showDNTOnly ? 'bg-blue-600/30 ring-1 ring-blue-500' : 'hover:bg-slate-800'
+              }`}
+              title="點擊僅顯示並閃爍 DNT 及包含 DNT 備註之管束"
+            >
               <div className="w-3 h-3 rounded-full bg-blue-600 flex items-center justify-center">
                 <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
               </div>
-              <span className="text-slate-300 ml-1">DNT 管凹陷</span>
-            </div>
+              <span className={`ml-1 ${showDNTOnly ? 'text-blue-300 font-bold' : 'text-slate-300'}`}>DNT 管凹陷</span>
+            </button>
           </div>
         </div>
       </div>
@@ -1434,6 +1458,13 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                     <span className="font-mono text-blue-300">{yearRecords[hoveredTube.id].code}</span>
                     <span className="text-slate-400">深度 (%):</span>
                     <span className="font-bold">{yearRecords[hoveredTube.id].size_val?.toFixed(1) || '0.0'}</span>
+                    
+                    {yearRecords[hoveredTube.id].notes && (
+                      <>
+                        <span className="text-slate-400 mt-1">備註:</span>
+                        <span className="text-amber-400 text-xs mt-1 self-center leading-tight">{yearRecords[hoveredTube.id].notes}</span>
+                      </>
+                    )}
                     
                     {viewMode === 'after' && (
                       <>

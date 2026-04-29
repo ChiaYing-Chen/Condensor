@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, LayoutDashboard, Settings, FileSpreadsheet, PlayCircle, Server, Loader2 } from 'lucide-react';
+import { Activity, LayoutDashboard, Settings, FileSpreadsheet, PlayCircle, Server, Loader2, Calculator } from 'lucide-react';
 import Dashboard from './components/Dashboard';
 import TubeSheetCanvas from './components/TubeSheetCanvas';
 import TrendAnalysis from './components/TrendAnalysis';
 import DecisionSystem from './components/DecisionSystem';
 import DataImport from './components/DataImport';
+import DutyCalculator from './components/DutyCalculator';
 
-type Tab = 'dashboard' | 'canvas' | 'trend' | 'decision' | 'import';
+type Tab = 'dashboard' | 'canvas' | 'trend' | 'decision' | 'calculator' | 'import';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
@@ -59,6 +60,7 @@ export default function App() {
       case 'canvas': return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
       case 'trend': return <TrendAnalysis unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
       case 'decision': return <DecisionSystem unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
+      case 'calculator': return <DutyCalculator unitId={selectedUnitId} />;
       case 'import': return <DataImport unitId={selectedUnitId} />;
       default: return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
     }
@@ -116,6 +118,7 @@ export default function App() {
             <NavItem icon={<PlayCircle size={20} />} label="動態視覺檢視" active={activeTab === 'canvas'} onClick={() => setActiveTab('canvas')} />
             <NavItem icon={<Activity size={20} />} label="瑕疵深度比對" active={activeTab === 'trend'} onClick={() => setActiveTab('trend')} />
             <NavItem icon={<Settings size={20} />} label="處置篩選系統" active={activeTab === 'decision'} onClick={() => setActiveTab('decision')} />
+            <NavItem icon={<Calculator size={20} />} label="熱負荷能力試算" active={activeTab === 'calculator'} onClick={() => setActiveTab('calculator')} />
             <NavItem icon={<FileSpreadsheet size={20} />} label="資料匯入與匯出" active={activeTab === 'import'} onClick={() => setActiveTab('import')} />
           </nav>
         </aside>

@@ -67,10 +67,18 @@ async function initDB() {
         channel VARCHAR(50),                         -- 頻道
         code VARCHAR(50),                            -- 瑕疵碼: PIT, NDD, COR, PLG, BLK...
         size_val FLOAT DEFAULT 0,                    -- 深度 %
+        notes TEXT,                                  -- 備註
         created_at TIMESTAMP DEFAULT NOW(),
         UNIQUE(unit_id, year, zone, row_num, col_num)
       );
     `);
+    
+    // 確保如果表已存在，補上 notes 欄位
+    try {
+      await pool.query('ALTER TABLE inspection_records ADD COLUMN IF NOT EXISTS notes TEXT;');
+    } catch (e) {
+      console.log('Column notes might already exist.');
+    }
     console.log('✅ `inspection_records` table ready.');
 
     // ============================================================

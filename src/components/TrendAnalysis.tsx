@@ -67,17 +67,19 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
         let isReplaced = false;
         let depth = Number(r.size_val) || 0;
         let code = r.code || 'NDD';
+        let notes = r.notes || '';
         if (mode === 'after') {
           const mainAction = maintenanceRes.find(m => m.zone === r.zone && m.row_num === r.row_num && m.col_num === r.col_num);
           if (mainAction) {
             if (mainAction.action === 'PLG' || mainAction.action === '塞管') { isPlugged = true; }
             else if (mainAction.action === 'RPL' || mainAction.action === '換管') { isPlugged = false; isReplaced = true; depth = 0; code = 'NDD'; }
+            if (mainAction.notes) notes = mainAction.notes;
           } else if (maintenanceRes.length === 0) {
             if (depth > 50) isPlugged = true;
             if (code === 'COR') isPlugged = true;
           }
         }
-        map.set(id, { id, zone: r.zone, depth, isPlugged, isReplaced, code });
+        map.set(id, { id, zone: r.zone, depth, isPlugged, isReplaced, code, notes });
       });
     }
     return map;
@@ -130,6 +132,7 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
           currentDepth: curr.isPlugged ? 100 : curr.depth,
           status: curr.isPlugged ? 'Plugged' : 'Normal',
           thinningRate, defectType: curr.code,
+          notes: curr.notes || prev.notes || '',
           isAnomaly, anomalyType, anomalyReason
         });
       });
@@ -176,7 +179,8 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
         [`${labelStr(currentSelection)} 深度 (%)`]: d.status === 'Normal' ? d.currentDepth.toFixed(2) : '已塞管',
         '狀態': d.isAnomaly ? '邏輯異常' : d.status === 'Plugged' ? '已塞管' : '正常',
         '成長率 (%)': d.isAnomaly ? d.anomalyReason : d.thinningRate.toFixed(2),
-        '缺陷類型': d.defectType
+        '缺陷類型': d.defectType,
+        '備註': d.notes
       };
     }));
     const wb = XLSX.utils.book_new();

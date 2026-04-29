@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { AlertTriangle, CheckCircle, XCircle, Clock, Loader2, X, Info, Play, Pause, SkipBack, SkipForward } from 'lucide-react';
+import { AlertTriangle, CheckCircle, XCircle, Clock, Loader2, X, Info, Play, Pause, SkipBack, SkipForward, Activity } from 'lucide-react';
 
 interface DashboardProps {
   unitData: any;
@@ -38,12 +38,16 @@ export default function Dashboard({ unitData }: DashboardProps) {
   });
   const [rulDetail, setRulDetail] = useState<RulDetail | null>(null);
   const [showRulModal, setShowRulModal] = useState(false);
+  const [showDutyModal, setShowDutyModal] = useState(false);
+  const [dutyStats, setDutyStats] = useState({ c4430t: 5870, c7150t: 442, block: 0 });
   const [availableYears, setAvailableYears] = useState<number[]>([]);
   const [maintenanceYears, setMaintenanceYears] = useState<number[]>([]);
   const [currentYearIndex, setCurrentYearIndex] = useState(0);
   const [viewMode, setViewMode] = useState<'before' | 'after'>('before');
+  const [historyMaxPlugged, setHistoryMaxPlugged] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playStepIndex, setPlayStepIndex] = useState(0);
+  const [historyMinCapacity, setHistoryMinCapacity] = useState<number | null>(null);
 
   const totalTubes = 6312;
 
@@ -84,6 +88,114 @@ export default function Dashboard({ unitData }: DashboardProps) {
     setLoading(true);
     setAvailableYears([]);
     setMaintenanceYears([]);
+
+    fetch(`${import.meta.env.BASE_URL}api/max_plugged?unit_id=${unitData.unit_id}`)
+      .then(r => r.json())
+      .then(data => setHistoryMaxPlugged(data.max_plugged || 0))
+      .catch(err => console.error(err));
+
+    const fetchMinCapacity = async () => {
+      try {
+        const yearsRes = await fetch(`${import.meta.env.BASE_URL}api/years?unit_id=${unitData.unit_id}`).then(r => r.json());
+        if (!Array.isArray(yearsRes) || yearsRes.length === 0) return;
+        
+        const maintYearsRes = await fetch(`${import.meta.env.BASE_URL}api/maintenance/years?unit_id=${unitData.unit_id}`).then(r => r.json());
+        const maintYears = Array.isArray(maintYearsRes) ? maintYearsRes : [];
+        
+        const tubesRes = await fetch(`${import.meta.env.BASE_URL}api/tubes?unit_id=${unitData.unit_id}`).then(r => r.json());
+        const tubes = Array.isArray(tubesRes) ? tubesRes : [];
+
+        let minCap = 100;
+
+        for (const y of yearsRes) {
+          const [recordsRes, maintRes] = await Promise.all([
+            fetch(`${import.meta.env.BASE_URL}api/records?unit_id=${unitData.unit_id}&year=${y}`).then(r => r.json()),
+            fetch(`${import.meta.env.BASE_URL}api/maintenance?unit_id=${unitData.unit_id}&year=${y}`).then(r => r.json())
+          ]);
+
+          const hasMaint = maintYears.includes(y) && Array.isArray(maintRes) && maintRes.length > 0;
+          const modes = hasMaint ? ['before', 'after'] : ['before'];
+          
+          for (const mode of modes) {
+            const currentPluggedSet = new Set<string>();
+            const retubedMatMap = new Map<string, string>();
+
+            if (Array.isArray(recordsRes)) {
+              recordsRes.forEach(r => {
+                const id = `${r.zone}-${r.row_num}-${r.col_num}`;
+                let action = null;
+                if (mode === 'after' && hasMaint) {
+                  action = maintRes.find((m: any) => m.zone === r.zone && m.row_num === r.row_num && m.col_num === r.col_num);
+                }
+
+                let isPlugged = r.code === 'PLG';
+                let depth = Number(r.size_val) || 0;
+                let code = r.code || 'NDD';
+
+                if (mode === 'after') {
+                  if (action) {
+                    if (action.action === 'PLG' || action.action === '塞管') isPlugged = true;
+                    else if (action.action === 'RPL' || action.action === '換管') {
+                      isPlugged = false;
+                      retubedMatMap.set(id, action.new_material || 'C7150T');
+                    }
+                  } else if (!hasMaint) {
+                    if (depth > 50) isPlugged = true;
+                    if (code === 'COR') isPlugged = true;
+                  }
+                }
+
+                if (isPlugged) {
+                  currentPluggedSet.add(id);
+                }
+              });
+            }
+
+            let d_c4430t = 0;
+            let d_c7150t = 0;
+
+            tubes.forEach((t: any) => {
+              const id = `${t.zone}-${t.row_num}-${t.col_num}`;
+              if (!currentPluggedSet.has(id)) {
+                let mat = t.material || '';
+                let wasInstalledAfter = false;
+                if (t.install_year) {
+                  if (t.install_year > y) {
+                    wasInstalledAfter = true;
+                  } else if (t.install_year === y && mode === 'before') {
+                    wasInstalledAfter = true;
+                  }
+                }
+
+                if (retubedMatMap.has(id)) {
+                  mat = retubedMatMap.get(id)!;
+                } else if (wasInstalledAfter) {
+                  mat = 'C4430T';
+                }
+
+                if (mat.includes('銅鎳') || mat.includes('C7150') || mat.includes('C7150T')) {
+                  d_c7150t++;
+                } else {
+                  d_c4430t++;
+                }
+              }
+            });
+
+            const current_Ko = (3219.18 * d_c4430t + 2902.69 * d_c7150t) / 6312;
+            const cap = (current_Ko / 3197.02) * 100;
+            if (cap < minCap) {
+              minCap = cap;
+            }
+          }
+        }
+        
+        setHistoryMinCapacity(minCap);
+      } catch (err) {
+        console.error("Failed to calculate history min capacity", err);
+      }
+    };
+
+    fetchMinCapacity();
 
     fetch(`${import.meta.env.BASE_URL}api/years?unit_id=${unitData.unit_id}`)
       .then(r => r.json())
@@ -132,7 +244,8 @@ export default function Dashboard({ unitData }: DashboardProps) {
     Promise.all([
       fetch(`${import.meta.env.BASE_URL}api/records?unit_id=${unitData.unit_id}&year=${currentYear}`).then(r => r.json()),
       fetch(`${import.meta.env.BASE_URL}api/maintenance?unit_id=${unitData.unit_id}&year=${currentYear}`).then(r => r.json()),
-    ]).then(async ([recordsRes, maintRes]) => {
+      fetch(`${import.meta.env.BASE_URL}api/tubes?unit_id=${unitData.unit_id}`).then(r => r.json()),
+    ]).then(async ([recordsRes, maintRes, tubesRes]) => {
 
       // 前一年資料：優先用大修處置結果，無則退回檢測紀錄
       let prevRecordsRes: any[] = [];
@@ -180,6 +293,8 @@ export default function Dashboard({ unitData }: DashboardProps) {
       let plugged = 0, retubed = 0, normal = 0, warning = 0;
       let totalThinningRate = 0, thinningCount = 0;
       let validDepthSum = 0, validDepthCount = 0;
+      const currentPluggedSet = new Set<string>();
+      const retubedMatMap = new Map<string, string>();
 
       const zStats: Record<string, ZoneStat> = {
         IL: { plugged: 0, retubed: 0, warning: 0, normal: 0, total: 0 },
@@ -206,7 +321,13 @@ export default function Dashboard({ unitData }: DashboardProps) {
           if (viewMode === 'after') {
             if (action) {
               if (action.action === 'PLG' || action.action === '塞管') isPlugged = true;
-              else if (action.action === 'RPL' || action.action === '換管') { isPlugged = false; isRetubed = true; depth = 0; code = 'NDD'; }
+              else if (action.action === 'RPL' || action.action === '換管') { 
+                isPlugged = false; 
+                isRetubed = true; 
+                depth = 0; 
+                code = 'NDD'; 
+                retubedMatMap.set(id, action.new_material || 'C7150T');
+              }
             } else if (!hasMaintenance) {
               if (depth > 50) isPlugged = true;
               if (code === 'COR') isPlugged = true;
@@ -217,6 +338,7 @@ export default function Dashboard({ unitData }: DashboardProps) {
 
           if (isPlugged) {
             plugged++;
+            currentPluggedSet.add(id);
             if (zStats[r.zone]) zStats[r.zone].plugged++;
           } else if (isRetubed) {
             retubed++;
@@ -244,6 +366,49 @@ export default function Dashboard({ unitData }: DashboardProps) {
       const rul = avgThinningRate > 0 ? (REPLACE_THRESHOLD - avgDepth) / avgThinningRate : 99;
       const representativeness = (thinningCount / totalTubes) * 100;
 
+      let d_c4430t = 0;
+      let d_c7150t = 0;
+      let d_block = 0;
+
+      if (Array.isArray(tubesRes) && tubesRes.length > 0) {
+        tubesRes.forEach((t: any) => {
+          const id = `${t.zone}-${t.row_num}-${t.col_num}`;
+          const isPlugged = currentPluggedSet.has(id);
+          if (isPlugged) {
+            d_block++;
+          } else {
+            let mat = t.material || '';
+            let wasInstalledAfter = false;
+            if (t.install_year) {
+              if (t.install_year > currentYear) {
+                wasInstalledAfter = true;
+              } else if (t.install_year === currentYear && viewMode === 'before') {
+                wasInstalledAfter = true;
+              }
+            }
+            
+            if (retubedMatMap.has(id)) {
+              mat = retubedMatMap.get(id)!;
+            } else if (wasInstalledAfter) {
+              mat = 'C4430T'; // fallback for tubes replaced in the future
+            }
+
+            if (mat.includes('銅鎳') || mat.includes('C7150') || mat.includes('C7150T')) {
+              d_c7150t++;
+            } else if (mat.includes('黃銅') || mat.includes('C4430') || mat.includes('C4430T')) {
+              d_c4430t++;
+            } else {
+              d_c4430t++; // Default
+            }
+          }
+        });
+      } else {
+        d_block = plugged;
+        d_c4430t = Math.max(0, 5870 - retubed - plugged);
+        d_c7150t = 442 + retubed;
+      }
+
+      setDutyStats({ c4430t: d_c4430t, c7150t: d_c7150t, block: d_block });
       setStats({ plugged, retubed, normal, warning, avgThinningRate, rul });
       setZoneStats(zStats);
       setRulDetail({
@@ -272,8 +437,14 @@ export default function Dashboard({ unitData }: DashboardProps) {
   }
 
   const pluggingRatio = (stats.plugged / totalTubes) * 100;
-  const isPluggingWarning = pluggingRatio > 8;
+  const historyMaxPluggingRatio = (historyMaxPlugged / totalTubes) * 100;
   const totalNonPlugged = stats.normal + stats.retubed;
+
+  const { c4430t, c7150t, block } = dutyStats;
+  const current_Ko = (3219.18 * c4430t + 2902.69 * c7150t) / totalTubes;
+  const dutyPercentage = (current_Ko / 3197.02) * 100;
+  const current_steam = 251759 * (dutyPercentage / 100);
+  const current_Q = 110212708.6 * (dutyPercentage / 100);
 
   return (
     <div className="space-y-3 relative">
@@ -404,11 +575,18 @@ export default function Dashboard({ unitData }: DashboardProps) {
       {/* KPI Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 pt-1">
         <KpiCard
-          title="總塞管率 (Plugging Ratio)"
-          value={`${pluggingRatio.toFixed(2)}%`}
-          subtitle="原廠設計餘裕: 10%"
-          icon={isPluggingWarning ? <AlertTriangle className="text-red-500" /> : <CheckCircle className="text-emerald-500" />}
-          alert={isPluggingWarning}
+          title="總塞管狀況 (Plugging Status)"
+          value={`${stats.plugged.toLocaleString()} 支 (${pluggingRatio.toFixed(2)}%)`}
+          subtitle={`歷史最高塞管: ${historyMaxPlugged.toLocaleString()} 支 (${historyMaxPluggingRatio.toFixed(2)}%)`}
+          icon={<XCircle className={pluggingRatio > 5 ? "text-red-500" : "text-slate-400"} />}
+        />
+        <KpiCard
+          title="熱負荷能力 (Condenser Duty)"
+          value={`${dutyPercentage.toFixed(2)}%`}
+          subtitle={historyMinCapacity !== null ? `歷史最低能力: ${historyMinCapacity.toFixed(2)}%` : `歷史最低能力: 計算中...`}
+          icon={<Activity className="text-rose-500" />}
+          onClick={() => setShowDutyModal(true)}
+          clickable
         />
         <KpiCard
           title="預期剩餘壽命 (RUL)"
@@ -418,12 +596,6 @@ export default function Dashboard({ unitData }: DashboardProps) {
           icon={<Clock className="text-blue-500" />}
           onClick={() => rulDetail && setShowRulModal(true)}
           clickable
-        />
-        <KpiCard
-          title="已塞管數量"
-          value={stats.plugged.toLocaleString()}
-          subtitle="需持續追蹤"
-          icon={<XCircle className="text-slate-400" />}
         />
         <KpiCard
           title="劣化警示 (>=40%)"
@@ -473,7 +645,7 @@ export default function Dashboard({ unitData }: DashboardProps) {
           <div className="lg:col-span-1 bg-slate-800/50 p-4 rounded-xl border border-slate-700/50 flex flex-col items-center justify-center relative min-h-[160px]">
             <div className="absolute top-3 left-4 w-full pr-8 flex justify-between items-center">
               <h4 className="text-base font-bold text-slate-200">全廠總覽</h4>
-              <span className="text-[10px] text-slate-400">總塞管率: <span className={isPluggingWarning ? 'text-red-400 font-bold' : 'text-emerald-400 font-bold'}>{pluggingRatio.toFixed(1)}%</span></span>
+              <span className="text-[10px] text-slate-400">總塞管率: <span className="text-slate-200 font-bold">{pluggingRatio.toFixed(1)}%</span></span>
             </div>
             
             <div className="mt-6 mb-3 flex-1 flex items-center justify-center">
@@ -554,6 +726,86 @@ export default function Dashboard({ unitData }: DashboardProps) {
             <div className="mt-5 p-3 bg-blue-950/40 border border-blue-900/50 rounded-lg flex gap-2 text-xs text-slate-300">
               <Info size={14} className="text-blue-400 mt-0.5 shrink-0" />
               <span>此為線性速率估算，實際壽命受操作條件、冷卻水水質、材質等因素影響，建議每次大修後重新評估。</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 熱負荷計算步驟 Modal */}
+      {showDutyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowDutyModal(false)}>
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-4xl mx-4 p-6 relative overflow-y-auto max-h-[90vh]" onClick={e => e.stopPropagation()}>
+            <button onClick={() => setShowDutyModal(false)} className="absolute top-4 right-4 text-slate-400 hover:text-white transition-colors">
+              <X size={20} />
+            </button>
+            
+            <div className="flex items-center gap-3 mb-5">
+              <div className="p-2 bg-rose-900/40 rounded-lg"><Activity className="text-rose-400" size={20} /></div>
+              <div>
+                <h3 className="text-lg font-bold text-white">熱負荷能力與效率估算</h3>
+                <p className="text-xs text-slate-400">Condenser Duty & Efficiency Calculation (Based on Over Design 1.49%)</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              {/* 設計值表格 */}
+              <div className="bg-slate-800/50 rounded-xl overflow-hidden border border-slate-700">
+                <div className="bg-slate-800 px-4 py-2 border-b border-slate-700">
+                  <h4 className="font-bold text-slate-200 text-sm">設計值 (100%)</h4>
+                </div>
+                <div className="p-4">
+                  <table className="w-full text-sm text-left text-slate-300">
+                    <tbody>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Koa (C4430T)</td><td className="py-2 text-right">3,219.18</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Kob (C7150T)</td><td className="py-2 text-right">2,902.69</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">C4430T 管數</td><td className="py-2 text-right text-emerald-400">5,870 支</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">C7150T 管數</td><td className="py-2 text-right text-emerald-400">442 支</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Block (塞管)</td><td className="py-2 text-right text-slate-500">0 支</td></tr>
+                      <tr className="border-b border-slate-700/50 font-bold"><td className="py-2">Total 管數</td><td className="py-2 text-right">6,312 支</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Design Flow</td><td className="py-2 text-right">248,020 kg/hr</td></tr>
+                      <tr className="border-b border-slate-700/50 bg-emerald-900/20"><td className="py-2 font-medium">可處理蒸汽量</td><td className="py-2 text-right text-emerald-300 font-bold">251,759 kg/hr</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Q (熱負荷)</td><td className="py-2 text-right">110,212,708.6</td></tr>
+                      <tr className="font-bold text-blue-300"><td className="py-2">Ko (總熱傳導率)</td><td className="py-2 text-right">3,197.02</td></tr>
+                    </tbody>
+                  </table>
+                  <div className="mt-3 text-[10px] text-slate-400 space-y-1">
+                    <p>Note:</p>
+                    <p>(1) Cleanliness Factor 以 0.85 計算</p>
+                    <p>(2) CW流速以 2.2 m/s 計算</p>
+                    <p>(3) Condenser熱交換率 Over Design 1.49%</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* 目前狀態估算表格 */}
+              <div className="bg-slate-800/50 rounded-xl overflow-hidden border border-slate-700">
+                <div className="bg-slate-800 px-4 py-2 border-b border-slate-700 flex justify-between items-center">
+                  <h4 className="font-bold text-slate-200 text-sm">目前狀態估算</h4>
+                  <span className="text-xs font-bold text-rose-400">{dutyPercentage.toFixed(2)}%</span>
+                </div>
+                <div className="p-4">
+                  <table className="w-full text-sm text-left text-slate-300">
+                    <tbody>
+                      <tr className="border-b border-slate-700/50"><td className="py-2 text-slate-500">Koa (C4430T)</td><td className="py-2 text-right text-slate-500">-</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2 text-slate-500">Kob (C7150T)</td><td className="py-2 text-right text-slate-500">-</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">C4430T 管數</td><td className="py-2 text-right text-amber-400">{c4430t.toLocaleString()} 支</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">C7150T 管數</td><td className="py-2 text-right text-blue-400">{c7150t.toLocaleString()} 支</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Block (塞管)</td><td className="py-2 text-right text-rose-400">{block.toLocaleString()} 支</td></tr>
+                      <tr className="border-b border-slate-700/50 font-bold"><td className="py-2">Total 管數</td><td className="py-2 text-right">6,312 支</td></tr>
+                      <tr className="border-b border-slate-700/50 bg-emerald-900/20"><td className="py-2 font-medium">可處理蒸汽量</td><td className="py-2 text-right text-emerald-300 font-bold">{current_steam.toLocaleString(undefined, {maximumFractionDigits:0})} kg/hr</td></tr>
+                      <tr className="border-b border-slate-700/50"><td className="py-2">Q (熱負荷)</td><td className="py-2 text-right">{current_Q.toLocaleString(undefined, {maximumFractionDigits:1})}</td></tr>
+                      <tr className="font-bold text-blue-300"><td className="py-2">Ko (總熱傳導率)</td><td className="py-2 text-right">{current_Ko.toFixed(2)}</td></tr>
+                    </tbody>
+                  </table>
+                  <div className="mt-3 text-[10px] text-slate-400 space-y-1">
+                    <p>Note:</p>
+                    <p>* 管束材質依據目前時間點對應資料庫之真實屬性計算</p>
+                    <p>* 材質含有「銅鎳」、「C7150」關鍵字歸類為 C7150T</p>
+                    <p>* 材質含有「黃銅」、「C4430」關鍵字歸類為 C4430T</p>
+                    <p>* 百分比 = 目前 Ko / 設計 Ko (3,197.02)</p>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
