@@ -281,18 +281,20 @@ export default function DataImport({ unitId }: DataImportProps) {
       let totalMissing = 0;
       let totalUnexpected = 0;
       
-      expectedPerZone.forEach((expectedCount, z) => {
-        const actualCount = zonesCount.get(z) || 0;
-        if (actualCount !== expectedCount) {
-          if (actualCount < expectedCount) {
-            totalMissing += (expectedCount - actualCount);
-            missingDetails.push(`[${z}] 少 ${expectedCount - actualCount} 筆`);
-          } else {
-            totalUnexpected += (actualCount - expectedCount);
-            missingDetails.push(`[${z}] 多 ${actualCount - expectedCount} 筆`);
+      if (importMode === 'before') {
+        expectedPerZone.forEach((expectedCount, z) => {
+          const actualCount = zonesCount.get(z) || 0;
+          if (actualCount !== expectedCount) {
+            if (actualCount < expectedCount) {
+              totalMissing += (expectedCount - actualCount);
+              missingDetails.push(`[${z}] 少 ${expectedCount - actualCount} 筆`);
+            } else {
+              totalUnexpected += (actualCount - expectedCount);
+              missingDetails.push(`[${z}] 多 ${actualCount - expectedCount} 筆`);
+            }
           }
-        }
-      });
+        });
+      }
 
       // 檢查是否有上傳了不在標準象限內的區域
       zonesCount.forEach((actualCount, z) => {
@@ -303,7 +305,7 @@ export default function DataImport({ unitId }: DataImportProps) {
       });
       
       const missingTubes: any[] = [];
-      if (masterMap && Array.isArray(masterMap)) {
+      if (importMode === 'before' && masterMap && Array.isArray(masterMap)) {
          masterMap.forEach((t: any) => {
            const tz = String(t.zone || '').trim();
            const tr = String(t.row || '').trim();
@@ -834,7 +836,7 @@ export default function DataImport({ unitId }: DataImportProps) {
                           {s.missingDetails.length > 0 && (
                             <div className="bg-slate-950/50 rounded p-2 mt-2">
                               <div className="flex justify-between items-center mb-1">
-                                <p className="text-red-300">資料遺失細節：</p>
+                                <p className="text-red-300">資料異常細節：</p>
                                 {s.missingTubes && s.missingTubes.length > 0 && (
                                   <button
                                     onClick={() => downloadList(s.missingTubes, '缺少清單', s.year)}
