@@ -242,7 +242,7 @@ app.get('/api/records', async (req, res) => {
 
 // 上傳檢測紀錄（覆寫需密碼）
 app.post('/api/records/upload', async (req, res) => {
-  const { password, records, unit_id } = req.body;
+  const { password, records, unit_id, material_updates } = req.body;
   const uid = unit_id || 'TG-1';
 
   if (!records || !Array.isArray(records) || records.length === 0) {
@@ -277,7 +277,6 @@ app.post('/api/records/upload', async (req, res) => {
         return res.status(403).json({ error: '部分年份的資料已存在，覆寫需要密碼', requirePassword: true });
       }
     }
-
     await pool.query('BEGIN');
 
     if (exists) {
@@ -292,11 +291,115 @@ app.post('/api/records/upload', async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
     `;
 
-    for (const row of records) {
-      const rawYear = row['年份'] || row['Year'] || row['year'];
-      const targetYear = normalizeYear(rawYear);
-      if (!targetYear) continue;
+    // 後端合併同一管位的多 Channel 紀錄
+    // 規則一：PLG + 任何檢測結果 (PIT/DNT/NDD) → 資料異常，跳過整個管位
+    // 規則二：同管位 Code 相同 → 保留深度 (size_val) 最大的那一筆
+    // 規則三：同管位 DNT + PIT → 保留 PIT，DNT 加入備註
+    const mergedMap = new Map();
+    let skippedNoYear = 0;
+    let skippedNoLocation = 0;
+    let skippedInvalid = 0;
+    let successCount = 0;
 
+    for (const row of records) {
+      const keys2 = Object.keys(row);
+      const yearK2 = keys2.find(k => k.includes('年份') || k.toLowerCase().includes('year'));
+      const rawYear2 = yearK2 ? row[yearK2] : (row['年份'] || row['Year'] || row['year']);
+      const ty = normalizeYear(rawYear2);
+      if (!ty) {
+        skippedNoYear++;
+        continue;
+      }
+
+      const zk2 = keys2.find(k => k.includes('區域') || k.toLowerCase().includes('zone'));
+      const rk2 = keys2.find(k => k.includes('行') || k.toLowerCase().includes('row'));
+      const ck2 = keys2.find(k => k.includes('列') || k.toLowerCase().includes('col'));
+      const chk2 = keys2.find(k => k.includes('頻道') || k.toLowerCase().includes('channel'));
+      const codeK2 = keys2.find(k => k.includes('瑕疵') || k.toLowerCase().includes('code'));
+      const sizeK2 = keys2.find(k => k.includes('深度') || k.toLowerCase().includes('size'));
+
+      const z2 = (zk2 ? String(row[zk2]) : '').trim().toUpperCase();
+      const r2 = parseInt(rk2 ? String(row[rk2]) : '', 10);
+      const c2 = parseInt(ck2 ? String(row[ck2]) : '', 10);
+      const ch2 = chk2 ? String(row[chk2] || '').trim() : '';
+      const code2 = codeK2 ? String(row[codeK2] || '').trim().toUpperCase() : '';
+      const size2 = sizeK2 ? parseFloat(row[sizeK2]) || 0 : 0;
+
+      if (!z2 || isNaN(r2) || isNaN(c2)) {
+        skippedNoLocation++;
+        continue;
+      }
+
+      const dedupKey = `${ty}-${z2}-${r2}-${c2}`;
+
+      if (!mergedMap.has(dedupKey)) {
+        mergedMap.set(dedupKey, {
+          row: { ...row },
+          codes: new Set([code2]),
+          maxSize: size2,
+          dntNotes: [],
+          invalid: false,
+          invalidReason: ''
+        });
+      } else {
+        const entry = mergedMap.get(dedupKey);
+        entry.codes.add(code2);
+
+        // 規則一：PLG 與任何檢測結果並存 → 資料矛盾
+        const hasPLG = entry.codes.has('PLG');
+        const hasInspection = entry.codes.has('PIT') || entry.codes.has('DNT') || entry.codes.has('NDD');
+        if (hasPLG && hasInspection) {
+          entry.invalid = true;
+          entry.invalidReason = `${z2}-${r2}-${c2}: PLG 與 ${[...entry.codes].filter(c => c !== 'PLG').join('/')} 並存，資料矛盾`;
+          console.error(`[INVALID] ${entry.invalidReason}`);
+          skippedInvalid++;
+          continue;
+        }
+
+        // 取得目前主紀錄的 code
+        const mainCodeKey = Object.keys(entry.row).find(k => k.includes('瑕疵') || k.toLowerCase().includes('code'));
+        const mainCode = mainCodeKey ? String(entry.row[mainCodeKey] || '').trim().toUpperCase() : '';
+
+        // 規則三：DNT + PIT → PIT 為主，DNT 入備註
+        if ((code2 === 'DNT' && mainCode === 'PIT') || (code2 === 'PIT' && mainCode === 'DNT')) {
+          if (code2 === 'PIT') {
+            // 新的是 PIT，替換主紀錄
+            const savedDntNotes = entry.dntNotes;
+            entry.row = { ...row };
+            entry.maxSize = size2;
+            entry.dntNotes = savedDntNotes;
+          }
+          // DNT 加入備註
+          entry.dntNotes.push(ch2 ? `DNT(${ch2})` : 'DNT');
+          console.warn(`[MERGE] DNT+PIT 合併: ${dedupKey}`);
+          continue;
+        }
+
+        // 規則二：同 Code → 保留深度最大的那一筆
+        if (code2 === mainCode) {
+          if (size2 > entry.maxSize) {
+            entry.row = { ...row };
+            entry.maxSize = size2;
+          }
+          continue;
+        }
+
+        // 其他 Code 組合（NDD 與 PIT 等）：以深度決定
+        if (size2 > entry.maxSize) {
+          entry.row = { ...row };
+          entry.maxSize = size2;
+        }
+      }
+    }
+
+    // 寫入合併後的結果
+    for (const [, entry] of mergedMap.entries()) {
+      if (entry.invalid) {
+        console.error(`[SKIP] 跳過資料異常管位: ${entry.invalidReason}`);
+        continue;
+      }
+
+      const row = entry.row;
       const keys = Object.keys(row);
       const zoneKey = keys.find(k => k.includes('區域') || k.toLowerCase().includes('zone'));
       const rowKey  = keys.find(k => k.includes('行') || k.toLowerCase().includes('row'));
@@ -305,6 +408,11 @@ app.post('/api/records/upload', async (req, res) => {
       const codeKey = keys.find(k => k.includes('瑕疵') || k.toLowerCase().includes('code'));
       const sizeKey = keys.find(k => k.includes('深度') || k.toLowerCase().includes('size'));
       const notesKey = keys.find(k => k.includes('備註') || k.toLowerCase().includes('notes'));
+      const yearKey = keys.find(k => k.includes('年份') || k.toLowerCase().includes('year'));
+
+      const rawYear = yearKey ? row[yearKey] : (row['年份'] || row['Year'] || row['year']);
+      const targetYear = normalizeYear(rawYear);
+      if (!targetYear) continue;
 
       const zone = zoneKey ? row[zoneKey] : null;
       const row_num = rowKey ? row[rowKey] : null;
@@ -312,25 +420,50 @@ app.post('/api/records/upload', async (req, res) => {
       const channel = channelKey ? row[channelKey] : null;
       const code = codeKey ? row[codeKey] : 'NDD';
       const size_val = sizeKey ? row[sizeKey] : 0;
-      const notes = notesKey ? row[notesKey] : null;
+
+      // 組合備註：原備註 + DNT 附記
+      const baseNotes = notesKey ? (row[notesKey] || '') : '';
+      const finalNotes = entry.dntNotes.length > 0
+        ? (baseNotes ? `${baseNotes}; 也檢測到${entry.dntNotes.join(',')}` : `也檢測到${entry.dntNotes.join(',')}`)
+        : baseNotes;
 
       if (zone && row_num && col_num) {
         await pool.query(insertQuery, [
           uid,
           targetYear,
-          zone.trim(),
+          String(zone).trim().toUpperCase(),
           parseInt(row_num, 10),
           parseInt(col_num, 10),
-          channel ? channel.trim() : null,
-          code ? code.trim() : 'NDD',
+          channel ? String(channel).trim() : null,
+          code ? String(code).trim().toUpperCase() : 'NDD',
           parseFloat(size_val) || 0,
-          notes ? notes.trim() : null
+          finalNotes || null
         ]);
+        successCount++;
+      }
+    }
+
+    // 處理材質更新
+    if (material_updates && Array.isArray(material_updates) && material_updates.length > 0) {
+      for (const update of material_updates) {
+        if (update.zone && !isNaN(update.row_num) && !isNaN(update.col_num) && update.material) {
+          await pool.query(
+            `INSERT INTO tube_registry (unit_id, zone, row_num, col_num, material, status)
+             VALUES ($1, $2, $3, $4, $5, 'active')
+             ON CONFLICT (unit_id, zone, row_num, col_num) 
+             DO UPDATE SET material = $5, updated_at = NOW()`,
+            [uid, update.zone.trim(), parseInt(update.row_num, 10), parseInt(update.col_num, 10), update.material.trim()]
+          );
+        }
       }
     }
 
     await pool.query('COMMIT');
-    res.json({ success: true, message: `成功儲存 ${uid} 共 ${targetYears.length} 個年份的資料 (${targetYears.join(', ')})` });
+    res.json({ 
+      success: true, 
+      message: `共處理 ${records.length} 筆資料。成功寫入 ${successCount} 筆。\n(跳過: 無年份=${skippedNoYear}, 無管位=${skippedNoLocation}, 資料矛盾=${skippedInvalid}, 經合併=${records.length - successCount - skippedNoYear - skippedNoLocation - skippedInvalid})`,
+      successCount
+    });
 
   } catch (error) {
     await pool.query('ROLLBACK');
@@ -511,6 +644,7 @@ app.post('/api/tubes/init', async (req, res) => {
 
   try {
     await pool.query('BEGIN');
+    let successCount = 0;
 
     for (const t of tubes) {
       await pool.query(
@@ -520,10 +654,14 @@ app.post('/api/tubes/init', async (req, res) => {
          DO UPDATE SET material = $5, install_year = $6, status = $7, updated_at = NOW()`,
         [uid, t.zone, t.row_num, t.col_num, t.material || '黃銅', t.install_year || null, t.status || 'active']
       );
+      successCount++;
     }
 
     await pool.query('COMMIT');
-    res.json({ success: true, message: `成功初始化 ${uid} 共 ${tubes.length} 筆管登錄資料` });
+    res.json({ 
+      message: `共處理 ${tubes.length} 筆資料。成功寫入 ${successCount} 筆。`, 
+      successCount 
+    });
 
   } catch (error) {
     await pool.query('ROLLBACK');

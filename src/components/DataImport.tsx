@@ -175,6 +175,7 @@ export default function DataImport({ unitId }: DataImportProps) {
 
     const codeKey = keys.find(k => k.includes('瑕疵') || k.toLowerCase().includes('code'));
     const sizeKey = keys.find(k => k.includes('深度') || k.toLowerCase().includes('size'));
+    const channelKey = keys.find(k => k.includes('頻道') || k.toLowerCase().includes('channel'));
     let notesKey = keys.find(k => k.includes('備註') || k.toLowerCase().includes('notes'));
     if (!notesKey) {
       notesKey = '備註';
@@ -226,11 +227,15 @@ export default function DataImport({ unitId }: DataImportProps) {
       const seenTubes = new Set<string>(); // Added for missing tubes tracking
       
       const finalYearData: any[] = [];
+      const mergedRecords: any[] = [];
 
       yearData.forEach(row => {
-        const zone = zoneKey ? String(row[zoneKey] || '').trim() : '';
-        const r = String(row[rowKey!] || '').trim();
-        const c = String(row[colKey!] || '').trim();
+        const zone = zoneKey ? String(row[zoneKey] || '').trim().toUpperCase() : '';
+        const rawR = String(row[rowKey!] || '').trim();
+        const rawC = String(row[colKey!] || '').trim();
+        
+        const r = isNaN(parseInt(rawR, 10)) ? rawR : parseInt(rawR, 10).toString();
+        const c = isNaN(parseInt(rawC, 10)) ? rawC : parseInt(rawC, 10).toString();
         
         const key = `${zone}-${r}-${c}`;
         seenTubes.add(key);
@@ -240,17 +245,32 @@ export default function DataImport({ unitId }: DataImportProps) {
           const existingCode = codeKey ? String(existingRow[codeKey] || '').trim().toUpperCase() : '';
           const newCode = codeKey ? String(row[codeKey] || '').trim().toUpperCase() : '';
           
-          if ((existingCode === 'PIT' && newCode === 'DNT') || (existingCode === 'DNT' && newCode === 'PIT')) {
+          if (
+            (existingCode === 'PIT' && newCode === 'DNT') || 
+            (existingCode === 'DNT' && newCode === 'PIT') ||
+            (existingCode === 'PIT' && newCode === 'NDD') || 
+            (existingCode === 'NDD' && newCode === 'PIT')
+          ) {
+            let subCode = newCode;
+            let finalCode = existingCode;
             if (newCode === 'PIT') {
               if (codeKey) existingRow[codeKey] = row[codeKey];
               if (sizeKey) existingRow[sizeKey] = row[sizeKey];
+              subCode = existingCode;
+              finalCode = 'PIT';
             }
             // Add note to existingRow, appending if there is already a note
             if (existingRow[notesKey]) {
-              existingRow[notesKey] += ' (也檢測到DNT)';
+              existingRow[notesKey] += ` (也檢測到${subCode})`;
             } else {
-              existingRow[notesKey] = '也檢測到DNT';
+              existingRow[notesKey] = `也檢測到${subCode}`;
             }
+
+            mergedRecords.push({
+               zone, row: r, col: c, 
+               originalCodes: `${existingCode} 與 ${newCode}`,
+               finalResult: `${finalCode} (備註: 也檢測到${subCode})`
+            });
           } else {
             let isIdentical = true;
             for (const k of keys) {
@@ -273,7 +293,24 @@ export default function DataImport({ unitId }: DataImportProps) {
         } else {
           seenRecords.set(key, row);
           zonesCount.set(zone, (zonesCount.get(zone) || 0) + 1);
-          finalYearData.push(row);
+          
+          // 轉換為標準化格式，確保後端絕對能正確解析
+          const code = codeKey ? String(row[codeKey] || '').trim().toUpperCase() : 'NDD';
+          const size = sizeKey ? parseFloat(row[sizeKey]) || 0 : 0;
+          const channel = channelKey ? String(row[channelKey] || '').trim() : '';
+          const notes = String(row[notesKey] || '');
+          
+          finalYearData.push({
+            "機組/Unit": unitId,
+            "年份": year,
+            "區域/Zone": zone,
+            "行/Row": parseInt(r, 10),
+            "列/Col": parseInt(c, 10),
+            "頻道/Channel": channel,
+            "瑕疵/Code": code,
+            "深度/Size": size,
+            "備註": notes
+          });
         }
       });
 
@@ -307,10 +344,12 @@ export default function DataImport({ unitId }: DataImportProps) {
       const missingTubes: any[] = [];
       if (importMode === 'before' && masterMap && Array.isArray(masterMap)) {
          masterMap.forEach((t: any) => {
-           const tz = String(t.zone || '').trim();
-           const tr = String(t.row || '').trim();
-           const tc = String(t.col || '').trim();
-           const key = `${tz}-${tr}-${tc}`;
+            const tz = String(t.zone || '').trim().toUpperCase();
+            const rawTr = String(t.row || '').trim();
+            const rawTc = String(t.col || '').trim();
+            const tr = isNaN(parseInt(rawTr, 10)) ? rawTr : parseInt(rawTr, 10).toString();
+            const tc = isNaN(parseInt(rawTc, 10)) ? rawTc : parseInt(rawTc, 10).toString();
+            const key = `${tz}-${tr}-${tc}`;
            // 若該管號屬於預期區域，但沒有出現在這年上傳的資料中
            if (expectedPerZone.has(tz) && !seenTubes.has(key)) {
              missingTubes.push({
@@ -339,6 +378,7 @@ export default function DataImport({ unitId }: DataImportProps) {
         missingTubes,
         duplicates: duplicates.length,
         duplicateDetails: duplicates,
+        mergedRecords,
         quadrants: Array.from(zonesCount.keys()),
         status: yearStatus,
         action,
@@ -354,8 +394,19 @@ export default function DataImport({ unitId }: DataImportProps) {
   const confirmValidation = () => {
     const recordsToUpload: any[] = [];
     validationSummary.forEach(s => {
-      if (s.action === 'upload') {
+      if (s.action === 'upload' || s.action === 'upload_with_plg') {
         recordsToUpload.push(...s.records);
+
+        if (s.action === 'upload_with_plg' && s.missingTubes) {
+          const plgTubes = s.missingTubes.map((t: any) => ({
+            ...t,
+            "機組/Unit": unitId,
+            "年份": s.year,
+            "瑕疵/Code": "PLG",
+            "深度/Size": 0
+          }));
+          recordsToUpload.push(...plgTubes);
+        }
       }
     });
 
@@ -781,7 +832,7 @@ export default function DataImport({ unitId }: DataImportProps) {
                   'bg-red-900/10 border-red-800/50'
                 }`}>
                   <div className="flex justify-between items-start">
-                    <div>
+                    <div className="flex-1 pr-4">
                       <h4 className="text-lg font-bold text-white flex items-center gap-2">
                         {s.year} 年
                         {s.status === 'perfect' && <span className="text-xs font-normal px-2 py-0.5 rounded-full bg-emerald-900/50 text-emerald-400 border border-emerald-800">完整正確</span>}
@@ -854,6 +905,22 @@ export default function DataImport({ unitId }: DataImportProps) {
                           )}
                         </div>
                       )}
+                      
+                      {s.mergedRecords && s.mergedRecords.length > 0 && (
+                        <div className="mt-3 bg-blue-900/10 border border-blue-800/50 rounded p-3 text-sm">
+                          <p className="flex items-center gap-1 text-blue-400 font-medium mb-2">
+                            <Info size={16} /> 自動合併 {s.mergedRecords.length} 筆雙重瑕疵紀錄 (PIT+NDD/DNT)：
+                          </p>
+                          <div className="max-h-24 overflow-y-auto text-xs font-mono text-blue-200/80 space-y-1">
+                            {s.mergedRecords.map((m: any, i: number) => (
+                              <div key={i} className="flex gap-2">
+                                <span className="text-blue-300 w-24">({m.zone}-{m.row}-{m.col})</span>
+                                <span className="text-slate-400">{m.originalCodes} ➔ {m.finalResult}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                     
                     <div className="flex flex-col items-end gap-2 ml-4">
@@ -870,6 +937,9 @@ export default function DataImport({ unitId }: DataImportProps) {
                         }}
                       >
                         {s.status !== 'error' && <option value="upload">上傳此年份</option>}
+                        {s.status === 'error' && s.missing > 0 && s.duplicates === 0 && s.unexpected === 0 && (
+                          <option value="upload_with_plg">自動將缺少管束補為塞管(PLG)並上傳</option>
+                        )}
                         <option value="skip">忽略此年份 (不上傳)</option>
                       </select>
                     </div>
@@ -880,7 +950,7 @@ export default function DataImport({ unitId }: DataImportProps) {
             
             <div className="flex justify-between items-center mt-6 pt-4 border-t border-slate-800 shrink-0">
               <p className="text-sm text-slate-400">
-                將上傳 <span className="text-white font-bold">{validationSummary.filter(s => s.action === 'upload').length}</span> 個年份的資料
+                將上傳 <span className="text-white font-bold">{validationSummary.filter(s => s.action === 'upload' || s.action === 'upload_with_plg').length}</span> 個年份的資料
               </p>
               <div className="flex gap-3">
                 <button 
@@ -891,7 +961,7 @@ export default function DataImport({ unitId }: DataImportProps) {
                 </button>
                 <button 
                   onClick={confirmValidation}
-                  disabled={validationSummary.filter(s => s.action === 'upload').length === 0}
+                  disabled={status === 'uploading' || validationSummary.filter(s => s.action === 'upload' || s.action === 'upload_with_plg').length === 0}
                   className="px-5 py-2.5 rounded-lg text-sm bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 text-white font-medium shadow-lg transition-colors flex items-center gap-2"
                 >
                   <Upload size={16} />
