@@ -176,6 +176,8 @@ export default function DataImport({ unitId }: DataImportProps) {
     const codeKey = keys.find(k => k.includes('瑕疵') || k.toLowerCase().includes('code'));
     const sizeKey = keys.find(k => k.includes('深度') || k.toLowerCase().includes('size'));
     const channelKey = keys.find(k => k.includes('頻道') || k.toLowerCase().includes('channel'));
+    const actionKey = keys.find(k => k.includes('處置') || k.toLowerCase().includes('action'));
+    const materialKey = keys.find(k => k.includes('材質') || k.toLowerCase().includes('material'));
     let notesKey = keys.find(k => k.includes('備註') || k.toLowerCase().includes('notes'));
     if (!notesKey) {
       notesKey = '備註';
@@ -185,6 +187,7 @@ export default function DataImport({ unitId }: DataImportProps) {
     if (!yearKey) { setStatus('error'); setMessage('解析失敗：找不到「年份」欄位。'); return; }
     if (!rowKey)  { setStatus('error'); setMessage('解析失敗：找不到「行/Row」欄位。'); return; }
     if (!colKey)  { setStatus('error'); setMessage('解析失敗：找不到「列/Col」欄位。'); return; }
+    if (importMode === 'after' && !actionKey) { setStatus('error'); setMessage('解析失敗：找不到「處置/action」欄位。'); return; }
 
     const masterMap = generateTubeMap();
     const expectedTubesCount = masterMap?.length || 6312;
@@ -225,6 +228,7 @@ export default function DataImport({ unitId }: DataImportProps) {
       const duplicates: any[] = [];
       const zonesCount = new Map<string, number>();
       const seenTubes = new Set<string>(); // Added for missing tubes tracking
+      const invalidActions: any[] = [];
       
       const finalYearData: any[] = [];
       const mergedRecords: any[] = [];
@@ -300,17 +304,41 @@ export default function DataImport({ unitId }: DataImportProps) {
           const channel = channelKey ? String(row[channelKey] || '').trim() : '';
           const notes = String(row[notesKey] || '');
           
-          finalYearData.push({
-            "機組/Unit": unitId,
-            "年份": year,
-            "區域/Zone": zone,
-            "行/Row": parseInt(r, 10),
-            "列/Col": parseInt(c, 10),
-            "頻道/Channel": channel,
-            "瑕疵/Code": code,
-            "深度/Size": size,
-            "備註": notes
-          });
+          if (importMode === 'after') {
+            const action = actionKey ? String(row[actionKey] || '').trim().toUpperCase() : '';
+            const newMaterial = materialKey ? String(row[materialKey] || '').trim() : '';
+
+            if (!action) {
+              invalidActions.push({
+                excelRow: row._originalIndex,
+                zone, row: r, col: c
+              });
+              return;
+            }
+
+            finalYearData.push({
+              "機組/Unit": unitId,
+              "年份": year,
+              "區域/Zone": zone,
+              "行/Row": parseInt(r, 10),
+              "列/Col": parseInt(c, 10),
+              "處置/action": action,
+              "新材質/new_material": newMaterial,
+              "備註/notes": notes
+            });
+          } else {
+            finalYearData.push({
+              "機組/Unit": unitId,
+              "年份": year,
+              "區域/Zone": zone,
+              "行/Row": parseInt(r, 10),
+              "列/Col": parseInt(c, 10),
+              "頻道/Channel": channel,
+              "瑕疵/Code": code,
+              "深度/Size": size,
+              "備註": notes
+            });
+          }
         }
       });
 
@@ -340,6 +368,11 @@ export default function DataImport({ unitId }: DataImportProps) {
           missingDetails.push(`[${z}] 為未知象限，共 ${actualCount} 筆`);
         }
       });
+
+      if (invalidActions.length > 0) {
+        totalUnexpected += invalidActions.length;
+        missingDetails.push(`處置/action 空白，共 ${invalidActions.length} 筆`);
+      }
       
       const missingTubes: any[] = [];
       if (importMode === 'before' && masterMap && Array.isArray(masterMap)) {
@@ -961,7 +994,7 @@ export default function DataImport({ unitId }: DataImportProps) {
                 </button>
                 <button 
                   onClick={confirmValidation}
-                  disabled={status === 'uploading' || validationSummary.filter(s => s.action === 'upload' || s.action === 'upload_with_plg').length === 0}
+                  disabled={validationSummary.filter(s => s.action === 'upload' || s.action === 'upload_with_plg').length === 0}
                   className="px-5 py-2.5 rounded-lg text-sm bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:hover:bg-blue-600 text-white font-medium shadow-lg transition-colors flex items-center gap-2"
                 >
                   <Upload size={16} />

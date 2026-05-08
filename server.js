@@ -538,6 +538,8 @@ app.post('/api/maintenance/upload', async (req, res) => {
       );
     }
 
+    let insertedCount = 0;
+
     for (const row of records) {
       const rawYear = row['年份'] || row['Year'] || row['year'];
       const targetYear = normalizeYear(rawYear);
@@ -568,6 +570,7 @@ app.post('/api/maintenance/upload', async (req, res) => {
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
           [uid, targetYear, zone.trim(), row_num, col_num, act, new_material, notes]
         );
+        insertedCount++;
 
         // 如果是換管 (RPL)，更新 tube_registry 的材質與安裝年份
         if (act === 'RPL') {
@@ -600,8 +603,13 @@ app.post('/api/maintenance/upload', async (req, res) => {
       }
     }
 
+    if (insertedCount === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ error: '沒有任何有效的處置紀錄被寫入，請確認欄位包含「處置/action」且資料不為空白。' });
+    }
+
     await pool.query('COMMIT');
-    res.json({ success: true, message: `成功儲存 ${uid} 共 ${targetYears.length} 個年份的處置結果 (${targetYears.join(', ')})` });
+    res.json({ success: true, message: `成功儲存 ${uid} 共 ${targetYears.length} 個年份、${insertedCount} 筆處置結果 (${targetYears.join(', ')})` });
 
   } catch (error) {
     await pool.query('ROLLBACK');
