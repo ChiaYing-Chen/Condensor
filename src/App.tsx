@@ -83,15 +83,15 @@ export default function App() {
       {/* Main Content */}
       <div className="flex-1 flex overflow-hidden">
         {/* Sidebar */}
-        <aside className="w-72 bg-slate-900 border-r border-slate-800 flex flex-col shadow-xl z-20">
+        <aside className="w-56 shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col shadow-xl z-20">
           {/* Logo Area */}
-          <div className="px-6 py-6 border-b border-slate-800 flex items-center gap-3">
-            <Activity className="h-7 w-7 text-blue-500 shrink-0" />
-            <h1 className="text-xl font-bold tracking-tight text-white leading-tight">冷凝器分析與管理平台</h1>
+          <div className="px-4 py-6 border-b border-slate-800 flex items-center gap-2.5">
+            <Activity className="h-6 w-6 text-blue-500 shrink-0" />
+            <h1 className="text-base font-bold tracking-tight text-white leading-tight whitespace-nowrap">冷凝器分析與管理平台</h1>
           </div>
 
           {/* Unit Switcher */}
-          <div className="px-5 py-5 border-b border-slate-800/80 bg-slate-900/50">
+          <div className="px-4 py-5 border-b border-slate-800/80 bg-slate-900/50">
             <div className="flex items-center gap-2 text-sm text-slate-400 mb-2">
               <Server size={16} />
               <span className="font-medium">目前的檢視機組</span>
@@ -99,7 +99,7 @@ export default function App() {
             <select
               value={selectedUnitId}
               onChange={(e) => setSelectedUnitId(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm focus:ring-blue-500 focus:border-blue-500 shadow-inner outline-none cursor-pointer font-bold"
+              className="w-full bg-slate-950 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm text-center [text-align-last:center] focus:ring-blue-500 focus:border-blue-500 shadow-inner outline-none cursor-pointer font-bold"
             >
               {units.length > 0
                 ? units.map(u => (
@@ -113,7 +113,7 @@ export default function App() {
             </select>
           </div>
 
-          <nav className="flex-1 px-4 py-6 space-y-2 overflow-y-auto">
+          <nav className="flex-1 px-3 py-6 space-y-2 overflow-y-auto">
             <NavItem icon={<LayoutDashboard size={20} />} label="總覽儀表板" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
             <NavItem icon={<PlayCircle size={20} />} label="動態視覺檢視" active={activeTab === 'canvas'} onClick={() => setActiveTab('canvas')} />
             <NavItem icon={<Activity size={20} />} label="瑕疵深度比對" active={activeTab === 'trend'} onClick={() => setActiveTab('trend')} />
@@ -130,7 +130,7 @@ export default function App() {
 
         {/* Content Area */}
         <main className="flex-1 overflow-auto p-6">
-          <div className="max-w-7xl mx-auto">
+          <div className="w-full">
             {renderContent()}
           </div>
         </main>
@@ -144,7 +144,7 @@ function NavItem({ icon, label, active, onClick }: { icon: React.ReactNode, labe
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg transition-colors text-left ${
+      className={`w-full flex items-center gap-3 px-3 py-3 rounded-lg transition-colors text-left ${
         active 
           ? 'bg-blue-900/50 text-blue-400 font-medium border border-blue-800/50' 
           : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent'
