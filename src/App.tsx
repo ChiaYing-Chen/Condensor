@@ -121,6 +121,11 @@ export default function App() {
             <NavItem icon={<Calculator size={20} />} label="熱負荷能力試算" active={activeTab === 'calculator'} onClick={() => setActiveTab('calculator')} />
             <NavItem icon={<FileSpreadsheet size={20} />} label="資料匯入與匯出" active={activeTab === 'import'} onClick={() => setActiveTab('import')} />
           </nav>
+          
+          <div className="p-4 border-t border-slate-800 flex items-center justify-around bg-slate-950/40">
+            <div id="unified-app-launcher"></div>
+            <div id="unified-user-avatar"></div>
+          </div>
         </aside>
 
         {/* Content Area */}

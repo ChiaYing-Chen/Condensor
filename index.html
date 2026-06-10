@@ -1,9 +1,22 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-TW">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function () {
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = '/PIMCP/header/header.css';
+        document.head.appendChild(link);
+
+        var script = document.createElement('script');
+        script.src = '/PIMCP/header/header.js';
+        script.defer = true;
+        document.head.appendChild(script);
+      })();
+    </script>
     <title>冷凝器管理</title>
   </head>
   <body>
@@ -11,4 +24,3 @@
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
-
