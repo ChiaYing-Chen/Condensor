@@ -129,6 +129,27 @@ async function initDB() {
     console.log('✅ `decision_profiles` table ready.');
 
     // ============================================================
+    // 7. upload_history - 上傳歷史與批次快照
+    // ============================================================
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS upload_history (
+        id SERIAL PRIMARY KEY,
+        unit_id VARCHAR(20) NOT NULL REFERENCES units(unit_id),
+        data_type VARCHAR(50) NOT NULL,              -- 'maintenance' / 'inspection'
+        year INT NOT NULL,
+        file_name VARCHAR(255),
+        record_count INT DEFAULT 0,
+        action_summary JSONB,                        -- 處置/瑕疵動作統計
+        records_snapshot JSONB,                      -- 原始資料快照清單
+        is_overwrite BOOLEAN DEFAULT FALSE,          -- 是否為覆寫上傳
+        uploaded_by VARCHAR(100) DEFAULT '系統使用者',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_upload_history_unit_type ON upload_history(unit_id, data_type, year);
+    `);
+    console.log('✅ `upload_history` table ready.');
+
+    // ============================================================
     // 預設資料
     // ============================================================
 

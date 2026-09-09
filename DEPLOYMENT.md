@@ -3,10 +3,10 @@
 此指南說明如何將 Condensor 專案部署至 Windows Server (IIS) 並連線至遠端 PostgreSQL。
 
 ## 系統架構簡介
-- **Node.js 後端 (Express)**: 運行於本機 `http://localhost:3004`，負責處理 API 與密碼防護邏輯。
+- **Node.js 後端 (Express)**: 運行於本機 `http://localhost:3006`，負責處理 API 與密碼防護邏輯。
 - **Frontend (Vite + React)**: 專案經過預先打包 (`npm run build`)，靜態檔放置於 `dist/` 資料夾，交由 Node.js 後端統一 Serve。
 - **資料庫 (PostgreSQL)**: 連接至遠端伺服器 IP `10.122.51.61` 上的 `Condensor` 資料庫。
-- **網站代理 (IIS)**: 作為對外窗口，攔截 Port 80/443 的要求並轉發 (Reverse Proxy) 至 3004。
+- **網站代理 (IIS)**: 作為對外窗口，攔截 Port 80/443 的要求並轉發 (Reverse Proxy) 至 3006。
 
 ---
 
@@ -78,7 +78,7 @@ pm2-service-install
 6. 點選建立好的網站，進入 **Application Pools**（應用程式集區）。
    - 將該站台的集區 .NET CLR version 改為 `No Managed Code`。
 
-因為目錄下已有準備好的 `web.config`，IIS 啟動後就會自動把所有請求轉發給 `localhost:3004` 的 Node.js 服務了。
+因為目錄下已有準備好的 `web.config`，IIS 啟動後就會自動把所有請求轉發給 `localhost:3006` 的 Node.js 服務了。
 
 ---
 
@@ -86,7 +86,7 @@ pm2-service-install
 
 - **上傳被拒絕且沒有密碼視窗**：請檢查 `.env` 中的 `OVERWRITE_PASSWORD` 是否與系統預設 (`W521`) 一致。
 - **圖形顯示異常或年份未匯入**：前端有針對 `111` 這類民國年進行 `+1911` 處理，請確保原始 Excel/CSV 表頭有 `年份` 字眼。
-- **502 Bad Gateway**：代表 Node.js 後端 (3004) 沒有啟動，請打開命令列輸入 `pm2 status` 確認 `Condensor-Backend` 的運行狀態。
+- **502 Bad Gateway**：代表 Node.js 後端 (3006) 沒有啟動，請打開命令列輸入 `pm2 status` 確認 `Condensor-Backend` 的運行狀態。
 - **開啟網頁不斷要求輸入 AD 帳號密碼 (Kerberos/NTLM SSO 失敗)**：
   1. **最根本原因 (使用 IP 連線)**：若使用者透過 **IP 位址**（如 `http://10.122.51.61`）連線，Windows 安全機制會將其視為「網際網路 (Internet)」，並阻擋自動送出 AD 憑證，強制跳出密碼框。
   2. **解法一（最簡單、最推薦）**：**改用「電腦名稱 (Hostname)」連線**。例如改用 `http://SERVER-NAME/Condensor/`。只要使用電腦名稱，Windows 就會自動將其判定為「近端內部網路」，瞬間達成自動登入 (SSO)，不再跳出密碼框。

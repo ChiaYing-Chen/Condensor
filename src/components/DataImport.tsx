@@ -1,5 +1,8 @@
-import React, { useState } from 'react';
-import { Upload, FileType, CheckCircle2, AlertCircle, KeyRound, Loader2, X, Info, Download } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { 
+  Upload, FileType, CheckCircle2, AlertCircle, KeyRound, Loader2, X, Info, Download, 
+  History, Eye, RefreshCw, Search, Clock, FileSpreadsheet, ShieldAlert, FileText 
+} from 'lucide-react';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import { generateTubeMap } from '../utils/tubeMapGenerator';
@@ -20,6 +23,119 @@ export default function DataImport({ unitId }: DataImportProps) {
   const [pendingRecords, setPendingRecords] = useState<any[]>([]);
   const [pendingYear, setPendingYear] = useState<number | null>(null);
   const [validationSummary, setValidationSummary] = useState<any[]>([]);
+  const [currentFileName, setCurrentFileName] = useState<string>('');
+
+  // 歷史上傳紀錄狀態
+  const [historyList, setHistoryList] = useState<any[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyFilterType, setHistoryFilterType] = useState<'all' | 'maintenance' | 'inspection'>('all');
+  const [selectedHistoryItem, setSelectedHistoryItem] = useState<any | null>(null);
+  const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
+  const [detailSearchTerm, setDetailSearchTerm] = useState('');
+
+  // 取得歷史上傳紀錄
+  const fetchHistory = async () => {
+    setHistoryLoading(true);
+    try {
+      let url = `${import.meta.env.BASE_URL}api/upload_history?unit_id=${unitId}`;
+      if (historyFilterType !== 'all') {
+        url += `&data_type=${historyFilterType}`;
+      }
+      const response = await fetch(url);
+      if (response.ok) {
+        const data = await response.json();
+        setHistoryList(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch history:', err);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchHistory();
+  }, [unitId, historyFilterType]);
+
+  // 檢視歷史上傳明細快照
+  const viewHistoryDetail = async (item: any) => {
+    setSelectedHistoryItem(item);
+    setHistoryDetailLoading(true);
+    setDetailSearchTerm('');
+    try {
+      const res = await fetch(`${import.meta.env.BASE_URL}api/upload_history/${item.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setSelectedHistoryItem(data);
+      }
+    } catch (err) {
+      console.error('Failed to fetch upload detail:', err);
+    } finally {
+      setHistoryDetailLoading(false);
+    }
+  };
+
+  // 匯出快照為 CSV
+  const downloadSnapshotCSV = (item: any) => {
+    if (!item || !item.records_snapshot || item.records_snapshot.length === 0) return;
+    const isMaint = item.data_type === 'maintenance';
+    const csvData = item.records_snapshot.map((r: any) => {
+      if (isMaint) {
+        return {
+          '機組': item.unit_id,
+          '年份': item.year,
+          '區域': r.zone,
+          '行': r.row_num,
+          '列': r.col_num,
+          '處置': r.action,
+          '新材質': r.new_material || '',
+          '備註': r.notes || ''
+        };
+      } else {
+        return {
+          '機組': item.unit_id,
+          '年份': item.year,
+          '區域': r.zone,
+          '行': r.row_num,
+          '列': r.col_num,
+          '頻道': r.channel || '',
+          '瑕疵': r.code,
+          '深度': r.size_val,
+          '備註': r.notes || ''
+        };
+      }
+    });
+
+    const csvStr = Papa.unparse(csvData);
+    const blob = new Blob(["\uFEFF" + csvStr], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `${item.unit_id}_${item.year}_${isMaint ? '大修處置' : '檢測結果'}_上傳快照.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // 格式化台北時間 (UTC+8)
+  const formatTaipeiTime = (dateStr: string) => {
+    if (!dateStr) return '-';
+    try {
+      const d = new Date(dateStr);
+      return new Intl.DateTimeFormat('zh-TW', {
+        timeZone: 'Asia/Taipei',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+      }).format(d);
+    } catch {
+      return dateStr;
+    }
+  };
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
@@ -37,7 +153,12 @@ export default function DataImport({ unitId }: DataImportProps) {
     
     try {
       const endpoint = importMode === 'before' ? `${import.meta.env.BASE_URL}api/records/upload` : `${import.meta.env.BASE_URL}api/maintenance/upload`;
-      const bodyPayload = { records, password: pass, unit_id: unitId };
+      const bodyPayload = { 
+        records, 
+        password: pass, 
+        unit_id: unitId,
+        fileName: currentFileName || (importMode === 'before' ? `${unitId}_檢測資料.xlsx` : `${unitId}_大修處置.xlsx`)
+      };
 
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -61,6 +182,7 @@ export default function DataImport({ unitId }: DataImportProps) {
       setPendingRecords([]);
       setPassword('');
       setPendingYear(null);
+      fetchHistory(); // 重新整理歷史紀錄
     } catch (err: any) {
       setStatus('error');
       setMessage(`上傳失敗: ${err.message}`);
@@ -68,6 +190,7 @@ export default function DataImport({ unitId }: DataImportProps) {
   };
 
   const processFile = (file: File) => {
+    setCurrentFileName(file.name);
     const ext = file.name.split('.').pop()?.toLowerCase();
     
     // 檔名與機組匹配檢查
@@ -537,7 +660,7 @@ export default function DataImport({ unitId }: DataImportProps) {
   };
 
   return (
-    <div className="space-y-6 max-w-4xl relative">
+    <div className="space-y-6 w-full relative">
       <div>
         <h2 className="text-2xl font-bold text-white">資料匯入與匯出</h2>
         <p className="text-slate-400">目前選擇機組: <span className="text-blue-400 font-bold ml-1">{unitId}</span></p>
@@ -789,6 +912,389 @@ export default function DataImport({ unitId }: DataImportProps) {
           </div>
         </div>
       </div>
+
+      {/* ================================================================ */}
+      {/* 歷史上傳與處置紀錄 (Upload History) */}
+      {/* ================================================================ */}
+      <div className="bg-slate-900 p-8 rounded-xl shadow-sm border border-slate-800 mt-8">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-slate-800">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-100 flex items-center gap-2">
+              <History size={20} className="text-blue-400" />
+              歷史上傳與處置紀錄
+              <span className="text-xs font-normal px-2.5 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+                目前機組：{unitId}
+              </span>
+            </h3>
+            <p className="text-sm text-slate-400 mt-1">
+              追蹤每次上傳的檔案名稱、操作時間（台北時間 UTC+8）、筆數摘要與明細快照。即使資料庫年度被覆寫，歷史版本仍可隨時追溯比對。
+            </p>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {/* 篩選按鈕 */}
+            <div className="inline-flex rounded-lg border border-slate-700 p-1 bg-slate-950">
+              <button
+                onClick={() => setHistoryFilterType('all')}
+                className={`px-3 py-1 text-xs rounded-md font-medium transition-colors ${
+                  historyFilterType === 'all'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                全部
+              </button>
+              <button
+                onClick={() => setHistoryFilterType('maintenance')}
+                className={`px-3 py-1 text-xs rounded-md font-medium transition-colors ${
+                  historyFilterType === 'maintenance'
+                    ? 'bg-emerald-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                大修處置 (After)
+              </button>
+              <button
+                onClick={() => setHistoryFilterType('inspection')}
+                className={`px-3 py-1 text-xs rounded-md font-medium transition-colors ${
+                  historyFilterType === 'inspection'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                檢測結果 (Before)
+              </button>
+            </div>
+
+            <button
+              onClick={fetchHistory}
+              disabled={historyLoading}
+              title="重新整理歷史紀錄"
+              className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw size={16} className={historyLoading ? 'animate-spin' : ''} />
+            </button>
+          </div>
+        </div>
+
+        {/* 歷史列表表格 */}
+        <div className="mt-6 overflow-x-auto">
+          {historyLoading && historyList.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 text-slate-400">
+              <Loader2 className="animate-spin text-blue-500 mb-2" size={24} />
+              <p className="text-sm">正在載入歷史上傳紀錄...</p>
+            </div>
+          ) : historyList.length === 0 ? (
+            <div className="text-center py-12 border border-dashed border-slate-800 rounded-lg">
+              <FileSpreadsheet className="mx-auto text-slate-600 mb-2" size={36} />
+              <p className="text-slate-400 font-medium">尚無 {unitId} 的歷史上傳紀錄</p>
+              <p className="text-xs text-slate-500 mt-1">上傳檢測結果或大修處置後，系統將自動記錄於此。</p>
+            </div>
+          ) : (
+            <table className="w-full text-sm text-left text-slate-300">
+              <thead>
+                <tr className="border-b border-slate-800 text-slate-400 text-xs uppercase bg-slate-950/40">
+                  <th className="py-3 px-4">上傳時間 (台北時間)</th>
+                  <th className="py-3 px-4">機組</th>
+                  <th className="py-3 px-4">類別</th>
+                  <th className="py-3 px-4">年度</th>
+                  <th className="py-3 px-4">原始檔名</th>
+                  <th className="py-3 px-4">總筆數</th>
+                  <th className="py-3 px-4">摘要統計</th>
+                  <th className="py-3 px-4">狀態</th>
+                  <th className="py-3 px-4 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60">
+                {historyList.map((item) => {
+                  const isMaint = item.data_type === 'maintenance';
+                  const summary = item.action_summary || {};
+                  return (
+                    <tr key={item.id} className="hover:bg-slate-800/40 transition-colors">
+                      <td className="py-3.5 px-4 font-mono text-xs text-slate-300 whitespace-nowrap">
+                        <div className="flex items-center gap-1.5">
+                          <Clock size={13} className="text-slate-500 shrink-0" />
+                          {formatTaipeiTime(item.created_at)}
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <span className="px-2 py-0.5 rounded text-xs font-semibold bg-slate-800 text-orange-300 border border-slate-700">
+                          {item.unit_id}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 whitespace-nowrap">
+                        <span className={`px-2.5 py-0.5 rounded-full text-xs font-medium border ${
+                          isMaint
+                            ? 'bg-emerald-950/70 text-emerald-300 border-emerald-800/70'
+                            : 'bg-blue-950/70 text-blue-300 border-blue-800/70'
+                        }`}>
+                          {isMaint ? '大修處置 (After)' : '檢測結果 (Before)'}
+                        </span>
+                      </td>
+                      <td className="py-3.5 px-4 font-mono font-medium text-white">
+                        {item.year}
+                      </td>
+                      <td className="py-3.5 px-4 max-w-[320px] truncate text-slate-300 text-xs" title={item.file_name}>
+                        <div className="flex items-center gap-1.5">
+                          <FileText size={14} className="text-slate-500 shrink-0" />
+                          <span className="truncate">{item.file_name || '-'}</span>
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 font-mono font-medium text-slate-200">
+                        {item.record_count} 筆
+                      </td>
+                      <td className="py-3.5 px-4">
+                        <div className="flex flex-wrap gap-1 max-w-[280px]">
+                          {Object.entries(summary).slice(0, 3).map(([key, val]) => (
+                            <span key={key} className="px-1.5 py-0.5 text-[11px] rounded bg-slate-800/80 text-slate-300 border border-slate-700">
+                              {key}: <span className="font-bold text-white">{String(val)}</span>
+                            </span>
+                          ))}
+                          {Object.keys(summary).length > 3 && (
+                            <span className="text-[10px] text-slate-500 self-center">
+                              +{Object.keys(summary).length - 3}
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="py-3.5 px-4 whitespace-nowrap">
+                        {item.is_overwrite ? (
+                          <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-amber-950/60 text-amber-400 border border-amber-800/60">
+                            覆寫更新
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-slate-800 text-slate-400 border border-slate-700">
+                            正常寫入
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                        <button
+                          onClick={() => viewHistoryDetail(item)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 hover:text-white rounded-md border border-blue-700/50 text-xs transition-colors"
+                        >
+                          <Eye size={13} />
+                          查看明細
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {/* ================================================================ */}
+      {/* 歷史上傳明細快照檢視彈窗 (Detail Modal) */}
+      {/* ================================================================ */}
+      {selectedHistoryItem && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl w-[950px] max-w-full max-h-[88vh] flex flex-col overflow-hidden">
+            {/* 彈窗 Header */}
+            <div className="flex justify-between items-center px-6 py-4 border-b border-slate-800 bg-slate-950/50">
+              <div className="flex items-center gap-3">
+                <div className={`p-2 rounded-lg ${
+                  selectedHistoryItem.data_type === 'maintenance' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-blue-950 text-blue-400 border border-blue-800'
+                }`}>
+                  <FileSpreadsheet size={20} />
+                </div>
+                <div>
+                  <h4 className="font-bold text-white text-base flex items-center gap-2">
+                    上傳明細快照：{selectedHistoryItem.file_name || '無檔名'}
+                  </h4>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    上傳時間：{formatTaipeiTime(selectedHistoryItem.created_at)} ｜ 處理人員：{selectedHistoryItem.uploaded_by || '系統使用者'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setSelectedHistoryItem(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* 彈窗資訊列 */}
+            <div className="px-6 py-3 bg-slate-900/80 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="px-2.5 py-1 rounded bg-slate-800 text-orange-300 font-semibold border border-slate-700">
+                  機組：{selectedHistoryItem.unit_id}
+                </span>
+                <span className="px-2.5 py-1 rounded bg-slate-800 text-white font-semibold border border-slate-700">
+                  年度：{selectedHistoryItem.year} 年
+                </span>
+                <span className={`px-2.5 py-1 rounded font-medium border ${
+                  selectedHistoryItem.data_type === 'maintenance'
+                    ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                    : 'bg-blue-950 text-blue-300 border-blue-800'
+                }`}>
+                  {selectedHistoryItem.data_type === 'maintenance' ? '大修處置 (After)' : '檢測結果 (Before)'}
+                </span>
+                <span className="text-slate-400">
+                  總記錄數：<strong className="text-white">{selectedHistoryItem.record_count}</strong> 筆
+                </span>
+                {selectedHistoryItem.action_summary && (
+                  <div className="flex items-center gap-1.5 pl-2 border-l border-slate-700">
+                    {Object.entries(selectedHistoryItem.action_summary).map(([k, v]) => (
+                      <span key={k} className="px-2 py-0.5 rounded bg-slate-800/90 text-slate-300 border border-slate-700 text-[11px]">
+                        {k}: <strong className="text-blue-300">{String(v)}</strong>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* 匯出 CSV 按鈕 */}
+              <button
+                onClick={() => downloadSnapshotCSV(selectedHistoryItem)}
+                disabled={historyDetailLoading || !selectedHistoryItem.records_snapshot || selectedHistoryItem.records_snapshot.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md border border-slate-700 transition-colors disabled:opacity-50"
+              >
+                <Download size={14} />
+                下載此快照 CSV
+              </button>
+            </div>
+
+            {/* 搜尋過濾列 */}
+            <div className="px-6 py-3 bg-slate-950/30 border-b border-slate-800">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={15} />
+                <input
+                  type="text"
+                  value={detailSearchTerm}
+                  onChange={(e) => setDetailSearchTerm(e.target.value)}
+                  placeholder="過濾搜尋：輸入區域 (如 IR/OL)、行號、列號或備註關鍵字..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-4 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
+
+            {/* 明細表格本體 (Scrollable) */}
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              {historyDetailLoading ? (
+                <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                  <Loader2 className="animate-spin text-blue-500 mb-2" size={28} />
+                  <p className="text-sm">正在讀取完整快照資料...</p>
+                </div>
+              ) : !selectedHistoryItem.records_snapshot || selectedHistoryItem.records_snapshot.length === 0 ? (
+                <div className="text-center py-16 text-slate-500 text-sm">
+                  此筆歷史紀錄未包含原始快照資料。
+                </div>
+              ) : (() => {
+                const isMaint = selectedHistoryItem.data_type === 'maintenance';
+                const sTerm = detailSearchTerm.trim().toLowerCase();
+                const filtered = selectedHistoryItem.records_snapshot.filter((r: any) => {
+                  if (!sTerm) return true;
+                  const z = String(r.zone || '').toLowerCase();
+                  const row = String(r.row_num || '');
+                  const col = String(r.col_num || '');
+                  const act = String(r.action || r.code || '').toLowerCase();
+                  const notes = String(r.notes || '').toLowerCase();
+                  const loc = `${z}-${row}-${col}`;
+                  return z.includes(sTerm) || row === sTerm || col === sTerm || act.includes(sTerm) || notes.includes(sTerm) || loc.includes(sTerm);
+                });
+
+                return (
+                  <div>
+                    <div className="flex justify-between items-center text-xs text-slate-500 mb-2">
+                      <span>顯示 {filtered.length} / {selectedHistoryItem.records_snapshot.length} 筆資料</span>
+                    </div>
+                    <table className="w-full text-xs text-left text-slate-300">
+                      <thead className="sticky top-0 bg-slate-900 border-b border-slate-800 text-slate-400 uppercase">
+                        <tr>
+                          <th className="py-2.5 px-3">#</th>
+                          <th className="py-2.5 px-3">區域 (Zone)</th>
+                          <th className="py-2.5 px-3">行 (Row)</th>
+                          <th className="py-2.5 px-3">列 (Col)</th>
+                          {isMaint ? (
+                            <>
+                              <th className="py-2.5 px-3">處置動作 (Action)</th>
+                              <th className="py-2.5 px-3">新材質 (New Material)</th>
+                            </>
+                          ) : (
+                            <>
+                              <th className="py-2.5 px-3">頻道 (Channel)</th>
+                              <th className="py-2.5 px-3">瑕疵碼 (Code)</th>
+                              <th className="py-2.5 px-3">深度 (Size %)</th>
+                            </>
+                          )}
+                          <th className="py-2.5 px-3">備註說明 (Notes)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/50 font-mono">
+                        {filtered.slice(0, 300).map((r: any, idx: number) => {
+                          const actionCode = (isMaint ? r.action : r.code) || '';
+                          const isPlug = actionCode === 'PLG' || actionCode === '塞管';
+                          const isRetube = actionCode === 'RPL' || actionCode === '換管';
+                          return (
+                            <tr key={idx} className="hover:bg-slate-800/40 transition-colors">
+                              <td className="py-2 px-3 text-slate-500">{idx + 1}</td>
+                              <td className="py-2 px-3 font-semibold text-slate-300">{r.zone}</td>
+                              <td className="py-2 px-3 text-slate-200">{r.row_num}</td>
+                              <td className="py-2 px-3 text-slate-200">{r.col_num}</td>
+                              {isMaint ? (
+                                <>
+                                  <td className="py-2 px-3">
+                                    <span className={`px-2 py-0.5 rounded font-bold text-[11px] ${
+                                      isPlug ? 'bg-red-950 text-red-400 border border-red-800' :
+                                      isRetube ? 'bg-amber-950 text-amber-300 border border-amber-800' :
+                                      'bg-slate-800 text-slate-300'
+                                    }`}>
+                                      {r.action}
+                                    </span>
+                                  </td>
+                                  <td className="py-2 px-3 text-slate-400">{r.new_material || '-'}</td>
+                                </>
+                              ) : (
+                                <>
+                                  <td className="py-2 px-3 text-slate-400">{r.channel || '-'}</td>
+                                  <td className="py-2 px-3">
+                                    <span className={`px-2 py-0.5 rounded font-bold text-[11px] ${
+                                      r.code === 'PIT' ? 'bg-amber-950 text-amber-400 border border-amber-800' :
+                                      r.code === 'PLG' ? 'bg-red-950 text-red-400 border border-red-800' :
+                                      'bg-slate-800 text-slate-300'
+                                    }`}>
+                                      {r.code}
+                                    </span>
+                                  </td>
+                                  <td className="py-2 px-3 text-slate-200">
+                                    {r.size_val > 0 ? `${r.size_val}%` : '-'}
+                                  </td>
+                                </>
+                              )}
+                              <td className="py-2 px-3 font-sans text-slate-400 max-w-[250px] truncate" title={r.notes || ''}>
+                                {r.notes || '-'}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                    {filtered.length > 300 && (
+                      <div className="py-3 text-center text-xs text-slate-500 italic bg-slate-950/40 rounded mt-2">
+                        已預覽前 300 筆，若需查看完整資料請點擊上方「下載此快照 CSV」。
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* 彈窗 Footer */}
+            <div className="px-6 py-3 border-t border-slate-800 bg-slate-950/50 flex justify-end">
+              <button
+                onClick={() => setSelectedHistoryItem(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-medium transition-colors"
+              >
+                關閉視窗
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Password Modal Overlay */}
       {status === 'password_required' && (

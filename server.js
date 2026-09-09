@@ -11,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const port = process.env.PORT || 3004;
+const port = process.env.PORT || 3006;
 const OVERWRITE_PASSWORD = process.env.OVERWRITE_PASSWORD || 'W521';
 
 // Middleware
@@ -104,6 +104,19 @@ app.post('/api/settings', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// --- Restart Service (觸發 NSSM 自動重啟) ---
+app.post('/api/restart', async (req, res) => {
+  const { password } = req.body || {};
+  if (!password || password !== OVERWRITE_PASSWORD) {
+    return res.status(403).json({ error: '密碼錯誤，無法重啟服務' });
+  }
+  res.json({ success: true, message: '服務重啟指令已收到，將於 1 秒後由常駐程序重新啟動...' });
+  setTimeout(() => {
+    console.log('🔄 收到管理者重啟指令，程序正在退出以觸發 NSSM 重啟...');
+    process.exit(0);
+  }, 1000);
 });
 
 // --- Decision Profiles (處置篩選腳本) ---
@@ -242,8 +255,10 @@ app.get('/api/records', async (req, res) => {
 
 // 上傳檢測紀錄（覆寫需密碼）
 app.post('/api/records/upload', async (req, res) => {
-  const { password, records, unit_id, material_updates } = req.body;
+  const { password, records, unit_id, material_updates, fileName, file_name, uploaded_by } = req.body;
   const uid = unit_id || 'TG-1';
+  const uploadFileName = fileName || file_name || `${uid}_檢測原始資料.xlsx`;
+  const uploader = uploaded_by || '系統使用者';
 
   if (!records || !Array.isArray(records) || records.length === 0) {
     return res.status(400).json({ error: 'No records provided' });
@@ -392,6 +407,8 @@ app.post('/api/records/upload', async (req, res) => {
       }
     }
 
+    const inspectionWrittenList = [];
+
     // 寫入合併後的結果
     for (const [, entry] of mergedMap.entries()) {
       if (entry.invalid) {
@@ -428,18 +445,36 @@ app.post('/api/records/upload', async (req, res) => {
         : baseNotes;
 
       if (zone && row_num && col_num) {
+        const zUpper = String(zone).trim().toUpperCase();
+        const rInt = parseInt(row_num, 10);
+        const cInt = parseInt(col_num, 10);
+        const chStr = channel ? String(channel).trim() : null;
+        const cUpper = code ? String(code).trim().toUpperCase() : 'NDD';
+        const sVal = parseFloat(size_val) || 0;
+        const nStr = finalNotes || null;
+
         await pool.query(insertQuery, [
           uid,
           targetYear,
-          String(zone).trim().toUpperCase(),
-          parseInt(row_num, 10),
-          parseInt(col_num, 10),
-          channel ? String(channel).trim() : null,
-          code ? String(code).trim().toUpperCase() : 'NDD',
-          parseFloat(size_val) || 0,
-          finalNotes || null
+          zUpper,
+          rInt,
+          cInt,
+          chStr,
+          cUpper,
+          sVal,
+          nStr
         ]);
         successCount++;
+        inspectionWrittenList.push({
+          year: targetYear,
+          zone: zUpper,
+          row_num: rInt,
+          col_num: cInt,
+          channel: chStr,
+          code: cUpper,
+          size_val: sVal,
+          notes: nStr
+        });
       }
     }
 
@@ -455,6 +490,23 @@ app.post('/api/records/upload', async (req, res) => {
             [uid, update.zone.trim(), parseInt(update.row_num, 10), parseInt(update.col_num, 10), update.material.trim()]
           );
         }
+      }
+    }
+
+    // 寫入檢測上傳歷史與快照 (upload_history)
+    for (const y of targetYears) {
+      const yearRows = inspectionWrittenList.filter(r => r.year === y);
+      if (yearRows.length > 0) {
+        const codeSummary = {};
+        yearRows.forEach(r => {
+          const c = r.code || 'NDD';
+          codeSummary[c] = (codeSummary[c] || 0) + 1;
+        });
+        await pool.query(
+          `INSERT INTO upload_history (unit_id, data_type, year, file_name, record_count, action_summary, records_snapshot, is_overwrite, uploaded_by, created_at)
+           VALUES ($1, 'inspection', $2, $3, $4, $5, $6, $7, $8, NOW())`,
+          [uid, y, uploadFileName, yearRows.length, JSON.stringify(codeSummary), JSON.stringify(yearRows), exists, uploader]
+        );
       }
     }
 
@@ -494,8 +546,10 @@ app.get('/api/maintenance', async (req, res) => {
 
 // 上傳處置紀錄（覆寫需密碼）
 app.post('/api/maintenance/upload', async (req, res) => {
-  const { password, records, unit_id } = req.body;
+  const { password, records, unit_id, fileName, file_name, uploaded_by } = req.body;
   const uid = unit_id || 'TG-1';
+  const uploadFileName = fileName || file_name || `${uid}_大修處置結果.xlsx`;
+  const uploader = uploaded_by || '系統使用者';
 
   if (!records || !Array.isArray(records) || records.length === 0) {
     return res.status(400).json({ error: 'No records provided' });
@@ -539,6 +593,7 @@ app.post('/api/maintenance/upload', async (req, res) => {
     }
 
     let insertedCount = 0;
+    const insertedRowsList = [];
 
     for (const row of records) {
       const rawYear = row['年份'] || row['Year'] || row['year'];
@@ -571,6 +626,15 @@ app.post('/api/maintenance/upload', async (req, res) => {
           [uid, targetYear, zone.trim(), row_num, col_num, act, new_material, notes]
         );
         insertedCount++;
+        insertedRowsList.push({
+          year: targetYear,
+          zone: zone.trim(),
+          row_num,
+          col_num,
+          action: act,
+          new_material,
+          notes
+        });
 
         // 如果是換管 (RPL)，更新 tube_registry 的材質與安裝年份
         if (act === 'RPL') {
@@ -606,6 +670,23 @@ app.post('/api/maintenance/upload', async (req, res) => {
     if (insertedCount === 0) {
       await pool.query('ROLLBACK');
       return res.status(400).json({ error: '沒有任何有效的處置紀錄被寫入，請確認欄位包含「處置/action」且資料不為空白。' });
+    }
+
+    // 寫入處置上傳歷史與快照 (upload_history)
+    for (const y of targetYears) {
+      const yearRows = insertedRowsList.filter(r => r.year === y);
+      if (yearRows.length > 0) {
+        const actionSummary = {};
+        yearRows.forEach(r => {
+          const a = r.action || 'PLG';
+          actionSummary[a] = (actionSummary[a] || 0) + 1;
+        });
+        await pool.query(
+          `INSERT INTO upload_history (unit_id, data_type, year, file_name, record_count, action_summary, records_snapshot, is_overwrite, uploaded_by, created_at)
+           VALUES ($1, 'maintenance', $2, $3, $4, $5, $6, $7, $8, NOW())`,
+          [uid, y, uploadFileName, yearRows.length, JSON.stringify(actionSummary), JSON.stringify(yearRows), exists, uploader]
+        );
+      }
     }
 
     await pool.query('COMMIT');
@@ -678,6 +759,65 @@ app.post('/api/tubes/init', async (req, res) => {
   }
 });
 
+// --- Upload History (上傳歷史與快照查詢) ---
+
+// 查詢上傳歷史列表（排除龐大的 records_snapshot）
+app.get('/api/upload_history', async (req, res) => {
+  const { unit_id, data_type, year, limit } = req.query;
+  const maxLimit = Math.min(parseInt(limit, 10) || 100, 300);
+
+  try {
+    const conditions = [];
+    const params = [];
+
+    if (unit_id) {
+      params.push(unit_id);
+      conditions.push(`unit_id = $${params.length}`);
+    }
+    if (data_type) {
+      params.push(data_type);
+      conditions.push(`data_type = $${params.length}`);
+    }
+    if (year) {
+      params.push(parseInt(year, 10));
+      conditions.push(`year = $${params.length}`);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    params.push(maxLimit);
+
+    const queryStr = `
+      SELECT id, unit_id, data_type, year, file_name, record_count, action_summary, is_overwrite, uploaded_by, created_at
+      FROM upload_history
+      ${whereClause}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${params.length}
+    `;
+
+    const result = await pool.query(queryStr, params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 查詢單次上傳的完整明細快照
+app.get('/api/upload_history/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      'SELECT * FROM upload_history WHERE id = $1',
+      [parseInt(id, 10)]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '找不到該筆上傳紀錄' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Static Files (Production) ---
 app.use(express.static(path.join(__dirname, 'dist')));
 
@@ -705,10 +845,100 @@ const ensureDecisionProfilesTable = async () => {
   }
 };
 
+// ================================================================
+//  自動確保 upload_history 資料表存在與歷史資料回填 (Backfill)
+// ================================================================
+const ensureUploadHistoryTable = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS upload_history (
+        id SERIAL PRIMARY KEY,
+        unit_id VARCHAR(20) NOT NULL REFERENCES units(unit_id),
+        data_type VARCHAR(50) NOT NULL,              -- 'maintenance' / 'inspection'
+        year INT NOT NULL,
+        file_name VARCHAR(255),
+        record_count INT DEFAULT 0,
+        action_summary JSONB,                        -- 處置/瑕疵統計
+        records_snapshot JSONB,                      -- 原始資料快照清單
+        is_overwrite BOOLEAN DEFAULT FALSE,          -- 是否為覆寫上傳
+        uploaded_by VARCHAR(100) DEFAULT '系統使用者',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_upload_history_unit_type ON upload_history(unit_id, data_type, year);
+    `);
+    console.log('✅ upload_history table ensured.');
+
+    // 歷史大修處置資料回填 (Backfill)
+    const existingMaint = await pool.query(`
+      SELECT unit_id, year, COUNT(*) as cnt, MIN(created_at) as first_created
+      FROM maintenance_actions
+      GROUP BY unit_id, year
+    `);
+
+    for (const row of existingMaint.rows) {
+      const histCheck = await pool.query(
+        'SELECT id FROM upload_history WHERE unit_id = $1 AND data_type = $2 AND year = $3 LIMIT 1',
+        [row.unit_id, 'maintenance', row.year]
+      );
+      if (histCheck.rows.length === 0) {
+        const rowsRes = await pool.query(
+          'SELECT zone, row_num, col_num, action, new_material, notes FROM maintenance_actions WHERE unit_id = $1 AND year = $2 ORDER BY zone, row_num, col_num',
+          [row.unit_id, row.year]
+        );
+        const summary = {};
+        rowsRes.rows.forEach(r => {
+          const act = r.action || 'PLG';
+          summary[act] = (summary[act] || 0) + 1;
+        });
+        await pool.query(
+          `INSERT INTO upload_history (unit_id, data_type, year, file_name, record_count, action_summary, records_snapshot, is_overwrite, uploaded_by, created_at)
+           VALUES ($1, 'maintenance', $2, '系統既有大修處置資料', $3, $4, $5, FALSE, '系統初始化', $6)`,
+          [row.unit_id, row.year, rowsRes.rows.length, JSON.stringify(summary), JSON.stringify(rowsRes.rows), row.first_created || new Date()]
+        );
+        console.log(`📦 Backfilled maintenance history for ${row.unit_id} ${row.year} (${rowsRes.rows.length} rows)`);
+      }
+    }
+
+    // 歷史檢測結果資料回填 (Backfill)
+    const existingInspect = await pool.query(`
+      SELECT unit_id, year, COUNT(*) as cnt, MIN(created_at) as first_created
+      FROM inspection_records
+      GROUP BY unit_id, year
+    `);
+
+    for (const row of existingInspect.rows) {
+      const histCheck = await pool.query(
+        'SELECT id FROM upload_history WHERE unit_id = $1 AND data_type = $2 AND year = $3 LIMIT 1',
+        [row.unit_id, 'inspection', row.year]
+      );
+      if (histCheck.rows.length === 0) {
+        const rowsRes = await pool.query(
+          'SELECT zone, row_num, col_num, channel, code, size_val, notes FROM inspection_records WHERE unit_id = $1 AND year = $2 ORDER BY zone, row_num, col_num',
+          [row.unit_id, row.year]
+        );
+        const summary = {};
+        rowsRes.rows.forEach(r => {
+          const c = r.code || 'NDD';
+          summary[c] = (summary[c] || 0) + 1;
+        });
+        await pool.query(
+          `INSERT INTO upload_history (unit_id, data_type, year, file_name, record_count, action_summary, records_snapshot, is_overwrite, uploaded_by, created_at)
+           VALUES ($1, 'inspection', $2, '系統既有檢測結果資料', $3, $4, $5, FALSE, '系統初始化', $6)`,
+          [row.unit_id, row.year, rowsRes.rows.length, JSON.stringify(summary), JSON.stringify(rowsRes.rows), row.first_created || new Date()]
+        );
+        console.log(`📦 Backfilled inspection history for ${row.unit_id} ${row.year} (${rowsRes.rows.length} rows)`);
+      }
+    }
+  } catch (err) {
+    console.error('⚠️  Failed to ensure upload_history table / backfill:', err.message);
+  }
+};
+
 // Start Server
 app.listen(port, async () => {
   console.log(`Condensor Backend Server running on http://localhost:${port}`);
   await ensureDecisionProfilesTable();
+  await ensureUploadHistoryTable();
 });
 
 // ================================================================
