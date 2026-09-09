@@ -68,7 +68,7 @@ export default function App() {
 
 
   return (
-    <div className="min-h-screen bg-slate-950 flex flex-col font-sans text-slate-200">
+    <div className="h-screen overflow-hidden bg-slate-950 flex flex-col font-sans text-slate-200">
       {/* DB 離線警告橫幅 */}
       {dbOffline && (
         <div className="bg-amber-900/30 border-b border-amber-700/50 px-4 py-2 flex items-center gap-3 text-amber-400 text-sm">
