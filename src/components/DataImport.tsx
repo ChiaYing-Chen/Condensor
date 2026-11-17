@@ -20,6 +20,8 @@ export default function DataImport({ unitId }: DataImportProps) {
   const [duplicateList, setDuplicateList] = useState<any[]>([]);
   const [missingList, setMissingList] = useState<any[]>([]);
   const [password, setPassword] = useState('');
+  const [existingNotesCount, setExistingNotesCount] = useState<number>(0);
+  const [notesMode, setNotesMode] = useState<'merge' | 'overwrite'>('merge');
   const [pendingRecords, setPendingRecords] = useState<any[]>([]);
   const [pendingYear, setPendingYear] = useState<number | null>(null);
   const [validationSummary, setValidationSummary] = useState<any[]>([]);
@@ -157,6 +159,7 @@ export default function DataImport({ unitId }: DataImportProps) {
         records, 
         password: pass, 
         unit_id: unitId,
+        notes_mode: notesMode,
         fileName: currentFileName || (importMode === 'before' ? `${unitId}_檢測資料.xlsx` : `${unitId}_大修處置.xlsx`)
       };
 
@@ -170,6 +173,7 @@ export default function DataImport({ unitId }: DataImportProps) {
       
       if (!response.ok) {
         if (response.status === 403 && result.requirePassword) {
+          setExistingNotesCount(result.existingNotesCount || 0);
           setStatus('password_required');
           setMessage(result.error || '需要密碼以覆寫現有年份資料');
           return;
@@ -181,6 +185,7 @@ export default function DataImport({ unitId }: DataImportProps) {
       setMessage(`成功匯入！${result.message}`);
       setPendingRecords([]);
       setPassword('');
+      setExistingNotesCount(0);
       setPendingYear(null);
       fetchHistory(); // 重新整理歷史紀錄
     } catch (err: any) {
@@ -1316,6 +1321,40 @@ export default function DataImport({ unitId }: DataImportProps) {
             </p>
             
             <div className="space-y-4">
+              {existingNotesCount > 0 && (
+                <fieldset className="bg-amber-950/30 border border-amber-600/40 rounded-lg p-3 space-y-2">
+                  <legend className="text-xs font-semibold text-amber-300 px-1">
+                    備註覆蓋檢查（目前資料庫共有 {existingNotesCount} 筆非空白備註）
+                  </legend>
+                  <div className="flex items-start gap-2">
+                    <input
+                      id="import-notes-merge"
+                      name="importNotesMode"
+                      type="radio"
+                      checked={notesMode === 'merge'}
+                      onChange={() => setNotesMode('merge')}
+                      className="mt-1 accent-blue-500"
+                    />
+                    <label htmlFor="import-notes-merge" className="text-xs text-slate-200 cursor-pointer">
+                      合併保留既有備註（推薦，保留手動備註）
+                    </label>
+                  </div>
+                  <div className="flex items-start gap-2">
+                    <input
+                      id="import-notes-overwrite"
+                      name="importNotesMode"
+                      type="radio"
+                      checked={notesMode === 'overwrite'}
+                      onChange={() => setNotesMode('overwrite')}
+                      className="mt-1 accent-red-500"
+                    />
+                    <label htmlFor="import-notes-overwrite" className="text-xs text-slate-300 cursor-pointer">
+                      完全覆蓋（以新上傳檔案為準，無備註處清空）
+                    </label>
+                  </div>
+                </fieldset>
+              )}
+
               <div className="relative">
                 <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
                 <input 

@@ -253,9 +253,23 @@ app.get('/api/records', async (req, res) => {
   }
 });
 
+const mergeNoteStrings = (oldNote, newNote) => {
+  const parts = [];
+  const addParts = (str) => {
+    if (!str || typeof str !== 'string') return;
+    str.split(/;\s*/).map(s => s.trim()).filter(Boolean).forEach(p => {
+      if (!parts.includes(p)) parts.push(p);
+    });
+  };
+  addParts(oldNote);
+  addParts(newNote);
+  return parts.join('; ');
+};
+
 // 上傳檢測紀錄（覆寫需密碼）
 app.post('/api/records/upload', async (req, res) => {
   const { password, records, unit_id, material_updates, fileName, file_name, uploaded_by } = req.body;
+  const notesMode = req.body?.notes_mode === 'overwrite' ? 'overwrite' : 'merge';
   const uid = unit_id || 'TG-1';
   const uploadFileName = fileName || file_name || `${uid}_檢測原始資料.xlsx`;
   const uploader = uploaded_by || '系統使用者';
@@ -289,10 +303,32 @@ app.post('/api/records/upload', async (req, res) => {
 
     if (exists) {
       if (!password || password !== OVERWRITE_PASSWORD) {
-        return res.status(403).json({ error: '部分年份的資料已存在，覆寫需要密碼', requirePassword: true });
+        const notesCheck = await pool.query(
+          `SELECT COUNT(*)::int AS cnt FROM inspection_records
+           WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
+          [uid, targetYears]
+        );
+        const existingNotesCount = notesCheck.rows[0]?.cnt || 0;
+        return res.status(403).json({
+          error: '部分年份的資料已存在，覆寫需要密碼',
+          requirePassword: true,
+          existingNotesCount
+        });
       }
     }
     await pool.query('BEGIN');
+
+    const existingNotesMap = new Map();
+    if (exists && notesMode === 'merge') {
+      const oldNotesRes = await pool.query(
+        `SELECT year, zone, row_num, col_num, notes FROM inspection_records
+         WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
+        [uid, targetYears]
+      );
+      oldNotesRes.rows.forEach(r => {
+        existingNotesMap.set(`${r.year}-${String(r.zone).trim().toUpperCase()}-${r.row_num}-${r.col_num}`, r.notes);
+      });
+    }
 
     if (exists) {
       await pool.query(
@@ -451,7 +487,12 @@ app.post('/api/records/upload', async (req, res) => {
         const chStr = channel ? String(channel).trim() : null;
         const cUpper = code ? String(code).trim().toUpperCase() : 'NDD';
         const sVal = parseFloat(size_val) || 0;
-        const nStr = finalNotes || null;
+        const noteKey = `${targetYear}-${zUpper}-${rInt}-${cInt}`;
+        const prevNote = existingNotesMap.get(noteKey) || '';
+        const mergedNote = (exists && notesMode === 'merge' && prevNote)
+          ? mergeNoteStrings(prevNote, String(finalNotes || ''))
+          : finalNotes;
+        const nStr = mergedNote || null;
 
         await pool.query(insertQuery, [
           uid,
@@ -524,6 +565,130 @@ app.post('/api/records/upload', async (req, res) => {
   }
 });
 
+const syncUploadHistoryNotes = async (uid, dataType, targetYear, zoneUpper, rNum, cNum, dbNote, defaultRow) => {
+  const histRes = await pool.query(
+    `SELECT id, records_snapshot FROM upload_history
+     WHERE unit_id = $1 AND data_type = $2 AND year = $3
+     ORDER BY created_at DESC, id DESC LIMIT 1`,
+    [uid, dataType, targetYear]
+  );
+  if (histRes.rows.length > 0 && Array.isArray(histRes.rows[0].records_snapshot)) {
+    const snapshot = [...histRes.rows[0].records_snapshot];
+    const idx = snapshot.findIndex(
+      r => String(r.zone).trim().toUpperCase() === zoneUpper &&
+           Number(r.row_num) === rNum &&
+           Number(r.col_num) === cNum
+    );
+    if (idx >= 0) {
+      snapshot[idx] = { ...snapshot[idx], notes: dbNote };
+    } else if (dbNote !== null) {
+      snapshot.push(defaultRow);
+    }
+    await pool.query(
+      'UPDATE upload_history SET records_snapshot = $1, record_count = $2 WHERE id = $3',
+      [JSON.stringify(snapshot), snapshot.length, histRes.rows[0].id]
+    );
+  }
+};
+
+// --- Notes (單支管備註新增/修改，區分 Before 檢測紀錄與 After 處置紀錄) ---
+app.post('/api/notes', async (req, res) => {
+  const { unit_id, year, zone, row_num, col_num, before_notes, after_notes } = req.body || {};
+  const uid = unit_id || 'TG-1';
+  const targetYear = parseInt(year, 10);
+  const rNum = parseInt(row_num, 10);
+  const cNum = parseInt(col_num, 10);
+  const zoneStr = typeof zone === 'string' ? zone.trim() : '';
+
+  if (!zoneStr || Number.isNaN(targetYear) || Number.isNaN(rNum) || Number.isNaN(cNum)) {
+    return res.status(400).json({ error: '缺少有效的管束座標或年份參數' });
+  }
+  if (before_notes === undefined && after_notes === undefined) {
+    return res.status(400).json({ error: '未提供要更新的備註內容' });
+  }
+
+  const zoneUpper = zoneStr.toUpperCase();
+
+  try {
+    await pool.query('BEGIN');
+
+    if (before_notes !== undefined) {
+      const noteText = typeof before_notes === 'string' ? before_notes.trim() : '';
+      const dbNote = noteText || null;
+      const updateRes = await pool.query(
+        `UPDATE inspection_records
+         SET notes = $1
+         WHERE unit_id = $2 AND year = $3 AND zone = $4 AND row_num = $5 AND col_num = $6`,
+        [dbNote, uid, targetYear, zoneStr, rNum, cNum]
+      );
+      if (updateRes.rowCount === 0 && dbNote !== null) {
+        await pool.query(
+          `INSERT INTO inspection_records (unit_id, year, zone, row_num, col_num, code, size_val, notes)
+           VALUES ($1, $2, $3, $4, $5, 'NDD', 0, $6)`,
+          [uid, targetYear, zoneStr, rNum, cNum, dbNote]
+        );
+      }
+      await syncUploadHistoryNotes(uid, 'inspection', targetYear, zoneUpper, rNum, cNum, dbNote, {
+        year: targetYear,
+        zone: zoneUpper,
+        row_num: rNum,
+        col_num: cNum,
+        channel: null,
+        code: 'NDD',
+        size_val: 0,
+        notes: dbNote
+      });
+    }
+
+    if (after_notes !== undefined) {
+      const noteText = typeof after_notes === 'string' ? after_notes.trim() : '';
+      const dbNote = noteText || null;
+      const updateRes = await pool.query(
+        `UPDATE maintenance_actions
+         SET notes = $1
+         WHERE unit_id = $2 AND year = $3 AND zone = $4 AND row_num = $5 AND col_num = $6`,
+        [dbNote, uid, targetYear, zoneStr, rNum, cNum]
+      );
+      if (updateRes.rowCount === 0 && dbNote !== null) {
+        // 僅當該年份已有處置紀錄時才補寫 KEP，避免讓尚未大修的年份被判定為已有處置
+        const yearCheck = await pool.query(
+          'SELECT 1 FROM maintenance_actions WHERE unit_id = $1 AND year = $2 LIMIT 1',
+          [uid, targetYear]
+        );
+        if (yearCheck.rowCount === 0) {
+          await pool.query('ROLLBACK');
+          return res.status(400).json({ error: `${targetYear} 年尚無大修處置紀錄，無法新增處置後備註` });
+        }
+        await pool.query(
+          `INSERT INTO maintenance_actions (unit_id, year, zone, row_num, col_num, action, notes)
+           VALUES ($1, $2, $3, $4, $5, 'KEP', $6)`,
+          [uid, targetYear, zoneStr, rNum, cNum, dbNote]
+        );
+      }
+      await syncUploadHistoryNotes(uid, 'maintenance', targetYear, zoneUpper, rNum, cNum, dbNote, {
+        year: targetYear,
+        zone: zoneUpper,
+        row_num: rNum,
+        col_num: cNum,
+        action: 'KEP',
+        new_material: null,
+        notes: dbNote
+      });
+    }
+
+    await pool.query('COMMIT');
+    res.json({
+      success: true,
+      before_notes: before_notes !== undefined ? (typeof before_notes === 'string' ? before_notes.trim() : '') : undefined,
+      after_notes: after_notes !== undefined ? (typeof after_notes === 'string' ? after_notes.trim() : '') : undefined,
+    });
+  } catch (error) {
+    await pool.query('ROLLBACK');
+    console.error('Update Note Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Maintenance Actions (處置結果 / After) ---
 
 // 取得特定機組、特定年份的處置紀錄
@@ -547,6 +712,7 @@ app.get('/api/maintenance', async (req, res) => {
 // 上傳處置紀錄（覆寫需密碼）
 app.post('/api/maintenance/upload', async (req, res) => {
   const { password, records, unit_id, fileName, file_name, uploaded_by } = req.body;
+  const notesMode = req.body?.notes_mode === 'overwrite' ? 'overwrite' : 'merge';
   const uid = unit_id || 'TG-1';
   const uploadFileName = fileName || file_name || `${uid}_大修處置結果.xlsx`;
   const uploader = uploaded_by || '系統使用者';
@@ -579,11 +745,33 @@ app.post('/api/maintenance/upload', async (req, res) => {
 
     if (exists) {
       if (!password || password !== OVERWRITE_PASSWORD) {
-        return res.status(403).json({ error: '部分年份的處置資料已存在，覆寫需要密碼', requirePassword: true });
+        const notesCheck = await pool.query(
+          `SELECT COUNT(*)::int AS cnt FROM maintenance_actions
+           WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
+          [uid, targetYears]
+        );
+        const existingNotesCount = notesCheck.rows[0]?.cnt || 0;
+        return res.status(403).json({
+          error: '部分年份的處置資料已存在，覆寫需要密碼',
+          requirePassword: true,
+          existingNotesCount
+        });
       }
     }
 
     await pool.query('BEGIN');
+
+    const existingMaintNotesMap = new Map();
+    if (exists && notesMode === 'merge') {
+      const oldNotesRes = await pool.query(
+        `SELECT year, zone, row_num, col_num, action, notes FROM maintenance_actions
+         WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
+        [uid, targetYears]
+      );
+      oldNotesRes.rows.forEach(r => {
+        existingMaintNotesMap.set(`${r.year}-${String(r.zone).trim().toUpperCase()}-${r.row_num}-${r.col_num}`, r);
+      });
+    }
 
     if (exists) {
       await pool.query(
@@ -613,22 +801,32 @@ app.post('/api/maintenance/upload', async (req, res) => {
       const col_num = colKey ? parseInt(row[colKey], 10) : NaN;
       const action = actionKey ? row[actionKey] : null;
       const new_material = materialKey ? row[materialKey] : null;
-      const notes = notesKey ? row[notesKey] : null;
+      const rawNotes = notesKey ? row[notesKey] : null;
 
       if (zone && !isNaN(row_num) && !isNaN(col_num) && action) {
         let act = action.trim().toUpperCase();
         if (act === '換管') act = 'RPL';
         if (act === '塞管') act = 'PLG';
 
+        const zTrim = zone.trim();
+        const noteKey = `${targetYear}-${zTrim.toUpperCase()}-${row_num}-${col_num}`;
+        let finalNotes = rawNotes ? String(rawNotes).trim() : '';
+        if (exists && notesMode === 'merge' && existingMaintNotesMap.has(noteKey)) {
+          const oldEntry = existingMaintNotesMap.get(noteKey);
+          finalNotes = mergeNoteStrings(oldEntry.notes, finalNotes);
+          existingMaintNotesMap.delete(noteKey);
+        }
+        const notes = finalNotes || null;
+
         await pool.query(
           `INSERT INTO maintenance_actions (unit_id, year, zone, row_num, col_num, action, new_material, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-          [uid, targetYear, zone.trim(), row_num, col_num, act, new_material, notes]
+          [uid, targetYear, zTrim, row_num, col_num, act, new_material, notes]
         );
         insertedCount++;
         insertedRowsList.push({
           year: targetYear,
-          zone: zone.trim(),
+          zone: zTrim,
           row_num,
           col_num,
           action: act,
@@ -670,6 +868,27 @@ app.post('/api/maintenance/upload', async (req, res) => {
     if (insertedCount === 0) {
       await pool.query('ROLLBACK');
       return res.status(400).json({ error: '沒有任何有效的處置紀錄被寫入，請確認欄位包含「處置/action」且資料不為空白。' });
+    }
+
+    // 合併保留原本不在本次上傳清單中的手動備註（如正常管 KEP 備註）
+    if (exists && notesMode === 'merge' && existingMaintNotesMap.size > 0) {
+      for (const rem of existingMaintNotesMap.values()) {
+        const remZone = String(rem.zone).trim();
+        await pool.query(
+          `INSERT INTO maintenance_actions (unit_id, year, zone, row_num, col_num, action, new_material, notes)
+           VALUES ($1, $2, $3, $4, $5, 'KEP', NULL, $6)`,
+          [uid, rem.year, remZone, rem.row_num, rem.col_num, rem.notes]
+        );
+        insertedRowsList.push({
+          year: rem.year,
+          zone: remZone,
+          row_num: rem.row_num,
+          col_num: rem.col_num,
+          action: 'KEP',
+          new_material: null,
+          notes: rem.notes
+        });
+      }
     }
 
     // 寫入處置上傳歷史與快照 (upload_history)

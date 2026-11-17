@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Settings2, ShieldAlert, Wrench, AlertTriangle, Database, Plus, Trash2, Loader2, Play, Download, Save, Bookmark } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
@@ -13,21 +13,36 @@ interface Rule {
   enabled: boolean;
 }
 
+const compileRuleFormula = (formula: string) => {
+  let safeFormula = formula.replace(/%/g, '');
+  safeFormula = safeFormula.replace(/\+(\d+)/g, '$1');
+  // Replace single '=' with '===' if not part of >=, <=, !=, ==
+  safeFormula = safeFormula.replace(/(?<![=<>!])=(?![=])/g, '===');
+  // Replace 'and' with '&&', 'or' with '||'
+  safeFormula = safeFormula.replace(/\band\b/gi, '&&').replace(/\bor\b/gi, '||');
+  return safeFormula;
+};
+
 const evaluateRule = (formula: string, context: any) => {
   if (!formula.trim()) return false;
   try {
-    let safeFormula = formula.replace(/%/g, '');
-    safeFormula = safeFormula.replace(/\+(\d+)/g, '$1');
-    // Replace single '=' with '===' if not part of >=, <=, !=, ==
-    safeFormula = safeFormula.replace(/(?<![=<>!])=(?![=])/g, '===');
-    // Replace 'and' with '&&', 'or' with '||'
-    safeFormula = safeFormula.replace(/\band\b/gi, '&&').replace(/\bor\b/gi, '||');
-
+    const safeFormula = compileRuleFormula(formula);
     const keys = Object.keys(context);
     const values = Object.values(context);
     const func = new Function(...keys, `return ${safeFormula};`);
     return func(...values);
   } catch (e) {
+    return false;
+  }
+};
+
+const isFormulaSyntaxValid = (formula: string) => {
+  if (!formula.trim()) return false;
+  try {
+    const safeFormula = compileRuleFormula(formula);
+    new Function('TubeAge', 'depth_Diff', 'this_depth', 'previous_depth', 'Code', `return ${safeFormula};`);
+    return true;
+  } catch {
     return false;
   }
 };
@@ -39,6 +54,53 @@ const DEFAULT_RULES: Rule[] = [
   { id: '4', formula: 'Code = "COR"', enabled: true },
 ];
 
+const DEFAULT_WARNING_FORMULA = 'this_depth >= 40';
+
+const CODE_DEFINITIONS = [
+  { code: 'NDD', label: '無缺陷' },
+  { code: 'COR', label: '外部氨腐蝕' },
+  { code: 'DNT', label: '管凹陷' },
+  { code: 'PIT', label: '內部孔蝕' },
+  { code: 'PLG', label: '塞管' },
+  { code: 'BLK', label: '堵管' },
+  { code: 'RST', label: '渦電流探頭無法通過(無法檢測)' },
+] as const;
+
+const CODE_LABEL_MAP: Record<string, string> = Object.fromEntries(
+  CODE_DEFINITIONS.map(({ code, label }) => [code, label])
+);
+
+const VARIABLE_LABEL_MAP: Record<string, string> = {
+  TubeAge: '管齡(年)',
+  depth_Diff: '深度差異(%)',
+  this_depth: '當前深度(%)',
+  previous_depth: '前次深度(%)',
+  Code: '種類',
+};
+
+const formatReasonForExcel = (reason: string): string => {
+  let formatted = reason;
+
+  // Replace quoted defect codes (e.g. "COR" or 'COR') with their Chinese descriptions
+  formatted = formatted.replace(
+    /(['"])(NDD|COR|DNT|PIT|PLG|BLK|RST)\1/g,
+    (_match, _quote, code) => `"${CODE_LABEL_MAP[code] || code}"`
+  );
+
+  // Replace formula variable names with Chinese labels
+  Object.entries(VARIABLE_LABEL_MAP).forEach(([varName, label]) => {
+    formatted = formatted.replace(new RegExp(`\\b${varName}\\b`, 'g'), label);
+  });
+
+  // Replace logical operators for readability
+  formatted = formatted
+    .replace(/\band\b|&&/gi, '且')
+    .replace(/\bor\b|\|\|/gi, '或')
+    .replace(/={2,3}/g, '=');
+
+  return formatted;
+};
+
 export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSystemProps) {
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
@@ -49,10 +111,18 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
   const [previousSelection, setPreviousSelection] = useState<string>('');
   
   const [rules, setRules] = useState<Rule[]>(DEFAULT_RULES);
+  const [warningFormula, setWarningFormula] = useState<string>(DEFAULT_WARNING_FORMULA);
+  const [warningFormulaError, setWarningFormulaError] = useState<string>('');
   const [savedProfiles, setSavedProfiles] = useState<{name: string, rules: Rule[], remark?: string}[]>([]);
   const [activeProfile, setActiveProfile] = useState<string>('系統預設');
 
   const [suggestedList, setSuggestedList] = useState<any[]>([]);
+  const [warningList, setWarningList] = useState<any[]>([]);
+  const [hasGeneratedWarning, setHasGeneratedWarning] = useState(false);
+  const [activeResultTab, setActiveResultTab] = useState<'disposal' | 'warning'>('disposal');
+
+  const warningInputRef = useRef<HTMLInputElement>(null);
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
   // 原始快取資料
   const [tubesData, setTubesData] = useState<any[]>([]);
@@ -220,10 +290,25 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     }
   };
 
-  const runAnalysis = async () => {
+  const runAnalysis = async (targetMode: 'disposal' | 'warning' = 'disposal') => {
     if (!currentSelection || !previousSelection) return;
+
+    const trimmedWarning = warningFormula.trim();
+    if (targetMode === 'warning') {
+      if (!trimmedWarning) {
+        setWarningFormulaError('請輸入警示條件公式');
+        warningInputRef.current?.focus();
+        return;
+      }
+      if (!isFormulaSyntaxValid(trimmedWarning)) {
+        setWarningFormulaError('警示條件公式語法有誤，請檢查變數名稱與運算子');
+        warningInputRef.current?.focus();
+        return;
+      }
+      setWarningFormulaError('');
+    }
+
     setAnalyzing(true);
-    setSuggestedList([]);
 
     try {
       const [currMap, prevMap] = await Promise.all([
@@ -233,6 +318,9 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
 
       const activeRules = rules.filter(r => r.enabled && r.formula.trim().length > 0);
       const suggestions: any[] = [];
+      const warnings: any[] = [];
+      const shouldEvaluateWarning =
+        (targetMode === 'warning' || hasGeneratedWarning) && isFormulaSyntaxValid(trimmedWarning);
       const currentYear = new Date().getFullYear();
       
       const commissionYear = unitData.commission_year || 2018;
@@ -280,10 +368,28 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
             Code,
             reasons: matchedRules
           });
+        } else if (shouldEvaluateWarning && evaluateRule(trimmedWarning, context)) {
+          // 排除上方篩選規則後，仍符合警示條件的管束列入警示清單
+          warnings.push({
+            id,
+            quadrant: curr.zone,
+            TubeAge,
+            this_depth,
+            depth_Diff,
+            Code,
+            reasons: [`警示條件: ${trimmedWarning}`]
+          });
         }
       });
 
       setSuggestedList(suggestions.sort((a, b) => b.this_depth - a.this_depth));
+      if (shouldEvaluateWarning) {
+        setWarningList(warnings.sort((a, b) => b.this_depth - a.this_depth));
+      }
+      if (targetMode === 'warning') {
+        setHasGeneratedWarning(true);
+      }
+      setActiveResultTab(targetMode);
     } catch (e) {
       console.error(e);
     } finally {
@@ -291,9 +397,14 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     }
   };
 
-  const exportToExcel = () => {
-    if (suggestedList.length === 0) return;
-    const rows = suggestedList.map(item => {
+  const exportRowsToExcel = (
+    list: any[],
+    sheetName: string,
+    fileName: string,
+    conditionHeader = '觸發條件'
+  ) => {
+    if (list.length === 0) return;
+    const rows = list.map(item => {
       const parts = item.id.split('-');
       return {
         '區域': parts[0] || '',
@@ -302,7 +413,7 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
         '管齡(年)': item.TubeAge,
         '本次深度(%)': parseFloat(item.this_depth.toFixed(1)),
         '深度差異(%)': parseFloat(item.depth_Diff.toFixed(1)),
-        '觸發條件': item.reasons.join(' | ')
+        [conditionHeader]: item.reasons.map(formatReasonForExcel).join(' | ')
       };
     });
 
@@ -315,11 +426,11 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
       { wch: 10 }, // 管齡
       { wch: 14 }, // 本次深度
       { wch: 14 }, // 深度差異
-      { wch: 50 }, // 觸發條件
+      { wch: 65 }, // 觸發條件 / 警示條件
     ];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, '建議處置清單');
-    XLSX.writeFile(wb, `${unitData.unit_id}_建議處置清單.xlsx`);
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    XLSX.writeFile(wb, fileName);
   };
 
   if (!unitData || !unitData.unit_id) {
@@ -471,8 +582,64 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
             ))}
           </div>
 
-          <div className="mt-6 pt-4 border-t border-slate-800 space-y-3">
-            <div className="text-xs text-slate-500 font-mono bg-slate-950 p-3 rounded">
+          <div className="mt-6 pt-4 border-t border-slate-800 space-y-4">
+            <button
+              type="button"
+              onClick={() => runAnalysis('disposal')}
+              disabled={analyzing}
+              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
+            >
+              {analyzing ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} />}
+              {analyzing ? '篩選運算中...' : '執行篩選'}
+            </button>
+
+            <div className="bg-amber-950/20 border border-amber-500/30 rounded-lg p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle size={16} className="text-amber-400 shrink-0" aria-hidden="true" />
+                <label htmlFor="warning-formula-input" className="text-sm font-semibold text-amber-200">
+                  警示條件公式
+                </label>
+              </div>
+              <p id="warning-formula-help" className="text-xs text-slate-400">
+                排除上方篩選規則命中的管束後，符合此條件將列入警示清單
+              </p>
+              <input
+                ref={warningInputRef}
+                id="warning-formula-input"
+                name="warningFormula"
+                type="text"
+                value={warningFormula}
+                onChange={(e) => {
+                  setWarningFormula(e.target.value);
+                  if (warningFormulaError) setWarningFormulaError('');
+                }}
+                placeholder="例如: this_depth >= 40"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                aria-invalid={warningFormulaError ? 'true' : undefined}
+                aria-describedby={warningFormulaError ? 'warning-formula-help warning-formula-error' : 'warning-formula-help'}
+                className={`w-full bg-slate-900 border rounded px-3 py-2 text-sm text-amber-200 font-mono focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                  warningFormulaError ? 'border-red-500' : 'border-slate-700 focus:border-amber-500'
+                }`}
+              />
+              {warningFormulaError && (
+                <p id="warning-formula-error" role="alert" className="text-xs text-red-400">
+                  {warningFormulaError}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => runAnalysis('warning')}
+                disabled={analyzing}
+                className="w-full bg-amber-600 hover:bg-amber-500 text-white font-medium py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
+              >
+                {analyzing ? <Loader2 size={18} className="animate-spin" /> : <AlertTriangle size={18} />}
+                {analyzing ? '警示運算中...' : '產出警示清單'}
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-400 font-mono bg-slate-950 p-3 rounded">
               可使用變數：<br/>
               • <span className="text-blue-400">TubeAge</span>: 管齡(年)<br/>
               • <span className="text-blue-400">depth_Diff</span>: 深度差異(%)<br/>
@@ -480,95 +647,227 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
               • <span className="text-blue-400">previous_depth</span>: 前次深度(%)<br/>
               • <span className="text-blue-400">Code</span>: 種類字串(例如 "COR")
             </div>
-            
-            <button 
-              onClick={runAnalysis}
-              disabled={analyzing}
-              className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
+
+            <div
+              tabIndex={0}
+              role="region"
+              aria-labelledby="code-reference-caption"
+              className="bg-slate-950 p-3 rounded border border-slate-800/80 overflow-x-auto focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
             >
-              {analyzing ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} />}
-              {analyzing ? '篩選運算中...' : '執行篩選'}
-            </button>
+              <table className="w-full text-left border-collapse text-xs">
+                <caption
+                  id="code-reference-caption"
+                  className="text-left text-slate-400 font-mono mb-2"
+                >
+                  CODE 對照說明：
+                </caption>
+                <thead>
+                  <tr className="border-b border-slate-800 text-slate-400">
+                    <th scope="col" className="py-1.5 pr-3 font-semibold font-mono whitespace-nowrap">CODE</th>
+                    <th scope="col" className="py-1.5 font-semibold">代表意義</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {CODE_DEFINITIONS.map(({ code, label }) => (
+                    <tr key={code}>
+                      <th scope="row" className="py-1.5 pr-3 font-mono font-semibold text-blue-400 whitespace-nowrap">
+                        {code}
+                      </th>
+                      <td className="py-1.5 text-slate-300">{label}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 
         <div className="lg:col-span-8 bg-slate-900 p-6 rounded-xl shadow-sm border border-slate-800">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <ShieldAlert className="text-red-500" />
-              <h3 className="text-lg font-semibold text-slate-100">建議處置清單</h3>
-            </div>
-            <div className="flex items-center gap-3">
-              {onApplyToVisual && (
-                <button
-                  onClick={() => {
-                    const [sourceYearStr] = currentSelection.split('-');
-                    const [baseYearStr] = previousSelection.split('-');
-                    onApplyToVisual(suggestedList.map(item => item.id), Number(sourceYearStr), Number(baseYearStr));
-                  }}
-                  disabled={suggestedList.length === 0}
-                  className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
-                  title="將結果套用至動態視覺檢視的畫布上"
-                >
-                  <Play size={14} /> 在視覺圖中檢視
-                </button>
-              )}
-              <button
-                onClick={exportToExcel}
-                disabled={suggestedList.length === 0}
-                className="text-xs bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
-              >
-                <Download size={14} /> 處置清單下載
-              </button>
-              <div className="text-sm font-medium bg-red-900/20 text-red-400 px-3 py-1 rounded-full">
-                共 {suggestedList.length} 支管需處理
-              </div>
-            </div>
+          <div
+            role="tablist"
+            aria-label="篩選結果清單"
+            className="flex overflow-x-auto border-b border-slate-800 mb-5 gap-2"
+            onKeyDown={(e) => {
+              const tabOrder: Array<'disposal' | 'warning'> = ['disposal', 'warning'];
+              const currentIdx = tabOrder.indexOf(activeResultTab);
+              let nextIdx = currentIdx;
+              if (e.key === 'ArrowRight') nextIdx = (currentIdx + 1) % tabOrder.length;
+              else if (e.key === 'ArrowLeft') nextIdx = (currentIdx - 1 + tabOrder.length) % tabOrder.length;
+              else if (e.key === 'Home') nextIdx = 0;
+              else if (e.key === 'End') nextIdx = tabOrder.length - 1;
+              else return;
+              e.preventDefault();
+              setActiveResultTab(tabOrder[nextIdx]);
+              tabRefs.current[nextIdx]?.focus();
+            }}
+          >
+            <button
+              ref={(el) => { tabRefs.current[0] = el; }}
+              type="button"
+              role="tab"
+              id="tab-disposal"
+              aria-selected={activeResultTab === 'disposal'}
+              tabIndex={activeResultTab === 'disposal' ? 0 : -1}
+              onClick={() => setActiveResultTab('disposal')}
+              className={`relative flex-none pb-3 px-4 text-sm font-semibold flex items-center gap-2 transition-colors whitespace-nowrap focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 ${
+                activeResultTab === 'disposal'
+                  ? "text-white after:content-[''] after:absolute after:inset-x-0 after:bottom-0 after:border-b-2 after:border-blue-400"
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <ShieldAlert size={16} className="text-red-500" aria-hidden="true" />
+              <span>建議處置清單</span>
+              <span className="text-xs px-2 py-0.5 rounded-full bg-red-900/30 text-red-400">
+                {suggestedList.length}
+              </span>
+            </button>
+            <button
+              ref={(el) => { tabRefs.current[1] = el; }}
+              type="button"
+              role="tab"
+              id="tab-warning"
+              aria-selected={activeResultTab === 'warning'}
+              tabIndex={activeResultTab === 'warning' ? 0 : -1}
+              onClick={() => setActiveResultTab('warning')}
+              className={`relative flex-none pb-3 px-4 text-sm font-semibold flex items-center gap-2 transition-colors whitespace-nowrap focus-visible:outline focus-visible:outline-2 focus-visible:outline-amber-400 ${
+                activeResultTab === 'warning'
+                  ? "text-white after:content-[''] after:absolute after:inset-x-0 after:bottom-0 after:border-b-2 after:border-amber-400"
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <AlertTriangle size={16} className="text-amber-400" aria-hidden="true" />
+              <span>警示清單</span>
+              <span className="text-xs px-2 py-0.5 rounded-full bg-amber-900/30 text-amber-400">
+                {warningList.length}
+              </span>
+            </button>
           </div>
 
-          <div className="overflow-x-auto max-h-[500px] overflow-y-auto custom-scrollbar">
-            <table className="w-full text-left border-collapse">
-              <thead className="sticky top-0 bg-slate-900 shadow-sm z-10">
-                <tr className="bg-slate-800/50 border-y border-slate-800">
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">區域</th>
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">行/Row</th>
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">列/Col</th>
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">管齡</th>
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">本次深度</th>
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">深度差異</th>
-                  <th className="py-3 px-4 text-sm font-semibold text-slate-400">觸發條件</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800">
-                {suggestedList.map((item) => (
-                  <tr key={item.id} className="hover:bg-slate-800/50">
-                    {(() => { const parts = item.id.split('-'); return (<>
-                      <td className="py-3 px-4 text-sm font-bold text-blue-300">{parts[0]}</td>
-                      <td className="py-3 px-4 text-sm font-medium text-white">{parts[1]}</td>
-                      <td className="py-3 px-4 text-sm font-medium text-white">{parts[2]}</td>
-                    </>); })()}
-                    <td className="py-3 px-4 text-sm text-slate-300">{item.TubeAge} 年</td>
-                    <td className="py-3 px-4 text-sm text-red-400 font-bold">{item.this_depth.toFixed(1)}%</td>
-                    <td className="py-3 px-4 text-sm font-bold text-amber-500">
-                      +{item.depth_Diff.toFixed(1)}%
-                    </td>
-                    <td className="py-3 px-4 text-xs text-slate-400 max-w-[200px]">
-                      <ul className="list-disc pl-4 space-y-0.5">
-                        {item.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}
-                      </ul>
-                    </td>
-                  </tr>
-                ))}
-                {suggestedList.length === 0 && (
-                  <tr>
-                    <td colSpan={7} className="py-8 text-center text-slate-500">
-                      目前無符合條件的建議項目，點擊「執行篩選」開始檢查。
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+          {[
+            {
+              key: 'disposal' as const,
+              tabId: 'tab-disposal',
+              title: '建議處置清單',
+              icon: <ShieldAlert className="text-red-500" aria-hidden="true" />,
+              items: suggestedList,
+              downloadLabel: '處置清單下載',
+              sheetName: '建議處置清單',
+              fileName: `${unitData.unit_id}_建議處置清單.xlsx`,
+              conditionHeader: '觸發條件',
+              badgeClass: 'bg-red-900/20 text-red-400',
+              badgeText: `共 ${suggestedList.length} 支管需處理`,
+              depthClass: 'text-red-400',
+              emptyText: '目前無符合條件的建議項目，點擊「執行篩選」開始檢查。',
+            },
+            {
+              key: 'warning' as const,
+              tabId: 'tab-warning',
+              title: '警示清單',
+              icon: <AlertTriangle className="text-amber-400" aria-hidden="true" />,
+              items: warningList,
+              downloadLabel: '警示清單下載',
+              sheetName: '警示清單',
+              fileName: `${unitData.unit_id}_警示清單.xlsx`,
+              conditionHeader: '警示條件',
+              badgeClass: 'bg-amber-900/20 text-amber-400',
+              badgeText: `共 ${warningList.length} 支管需注意`,
+              depthClass: 'text-amber-400',
+              emptyText: hasGeneratedWarning
+                ? '目前無符合警示條件的項目（已排除處置篩選管束）。'
+                : '目前尚未產出警示清單，點擊「產出警示清單」開始檢查。',
+            },
+          ].map((panel) => (
+            <div
+              key={panel.key}
+              role="tabpanel"
+              aria-labelledby={panel.tabId}
+              hidden={activeResultTab !== panel.key}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                <div className="flex items-center gap-2">
+                  {panel.icon}
+                  <h3 className="text-lg font-semibold text-slate-100">{panel.title}</h3>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  {onApplyToVisual && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const [sourceYearStr] = currentSelection.split('-');
+                        const [baseYearStr] = previousSelection.split('-');
+                        onApplyToVisual(panel.items.map(item => item.id), Number(sourceYearStr), Number(baseYearStr));
+                      }}
+                      disabled={panel.items.length === 0}
+                      className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
+                      title="將結果套用至動態視覺檢視的畫布上"
+                    >
+                      <Play size={14} /> 在視覺圖中檢視
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => exportRowsToExcel(panel.items, panel.sheetName, panel.fileName, panel.conditionHeader)}
+                    disabled={panel.items.length === 0}
+                    className="text-xs bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
+                  >
+                    <Download size={14} /> {panel.downloadLabel}
+                  </button>
+                  <div className={`text-sm font-medium px-3 py-1 rounded-full ${panel.badgeClass}`}>
+                    {panel.badgeText}
+                  </div>
+                </div>
+              </div>
+
+              <div
+                tabIndex={0}
+                role="region"
+                aria-label={panel.title}
+                className="overflow-x-auto max-h-[500px] overflow-y-auto custom-scrollbar focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500"
+              >
+                <table className="w-full text-left border-collapse">
+                  <thead className="sticky top-0 bg-slate-900 shadow-sm z-10">
+                    <tr className="bg-slate-800/50 border-y border-slate-800">
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">區域</th>
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">行/Row</th>
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">列/Col</th>
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">管齡</th>
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">本次深度</th>
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">深度差異</th>
+                      <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">{panel.conditionHeader}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {panel.items.map((item) => (
+                      <tr key={item.id} className="hover:bg-slate-800/50">
+                        {(() => { const parts = item.id.split('-'); return (<>
+                          <td className="py-3 px-4 text-sm font-bold text-blue-300">{parts[0]}</td>
+                          <td className="py-3 px-4 text-sm font-medium text-white">{parts[1]}</td>
+                          <td className="py-3 px-4 text-sm font-medium text-white">{parts[2]}</td>
+                        </>); })()}
+                        <td className="py-3 px-4 text-sm text-slate-300">{item.TubeAge} 年</td>
+                        <td className={`py-3 px-4 text-sm font-bold ${panel.depthClass}`}>{item.this_depth.toFixed(1)}%</td>
+                        <td className="py-3 px-4 text-sm font-bold text-amber-500">
+                          +{item.depth_Diff.toFixed(1)}%
+                        </td>
+                        <td className="py-3 px-4 text-xs text-slate-400 max-w-[200px]">
+                          <ul className="list-disc pl-4 space-y-0.5">
+                            {item.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}
+                          </ul>
+                        </td>
+                      </tr>
+                    ))}
+                    {panel.items.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="py-8 text-center text-slate-500">
+                          {panel.emptyText}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </div>

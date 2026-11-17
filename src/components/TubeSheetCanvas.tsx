@@ -1,7 +1,25 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Layers, Loader2, Download, Table2, Image as ImageIcon, Upload, Palette, Eye, EyeOff, X, Lock } from 'lucide-react';
+import { Play, Pause, SkipBack, SkipForward, Layers, Loader2, Download, Table2, Image as ImageIcon, Upload, Palette, Eye, EyeOff, X, Lock, Pencil } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { generateTubeMap } from '../utils/tubeMapGenerator';
+
+function splitSystemDntNote(rawNote?: string | null): { systemDntTag: string; userNote: string } {
+  if (!rawNote) return { systemDntTag: '', userNote: '' };
+  const segments = rawNote.split(/;\s*/).map(s => s.trim()).filter(Boolean);
+  const dntSegments = segments.filter(s => /^也檢測到.*DNT/i.test(s));
+  const userSegments = segments.filter(s => !/^也檢測到.*DNT/i.test(s));
+  return {
+    systemDntTag: dntSegments.join('; '),
+    userNote: userSegments.join('; ')
+  };
+}
+
+function buildCombinedBeforeNote(systemDntTag: string, userNote: string): string {
+  const cleanUser = userNote.trim();
+  if (systemDntTag && cleanUser) return `${cleanUser}; ${systemDntTag}`;
+  if (systemDntTag) return systemDntTag;
+  return cleanUser;
+}
 
 // =============================================================
 // Air Cooling Zone (ACZ) 定義：IL/IR 內側前 28 行，每行的美应包含到第几COL
@@ -110,7 +128,27 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   const [uploadStatus, setUploadStatus] = useState<'idle'|'uploading'|'success'|'error'|'password_required'>('idle');
   const [uploadMessage, setUploadMessage] = useState('');
   const [uploadPassword, setUploadPassword] = useState('');
+  const [uploadExistingNotesCount, setUploadExistingNotesCount] = useState(0);
+  const [uploadNotesMode, setUploadNotesMode] = useState<'merge' | 'overwrite'>('merge');
   const [pendingUploadRecords, setPendingUploadRecords] = useState<any[]>([]);
+
+  // 單支管備註編輯 Modal 與 Hover 緩衝
+  const isTooltipHoveredRef = useRef(false);
+  const hoverHideTimerRef = useRef<number | null>(null);
+  const noteDialogRef = useRef<HTMLDialogElement>(null);
+  const beforeTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const afterTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const [editingTarget, setEditingTarget] = useState<{
+    tube: any;
+    year: number;
+    hasAfter: boolean;
+    activeMode: ViewMode;
+    systemDntTag: string;
+  } | null>(null);
+  const [editBeforeNote, setEditBeforeNote] = useState('');
+  const [editAfterNote, setEditAfterNote] = useState('');
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [noteSaveError, setNoteSaveError] = useState('');
 
   // 閨牍動畫相關 ref
   const blinkPhaseRef = useRef<boolean>(true); // true = 顯示, false = 隱藏
@@ -602,14 +640,135 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   }, [tubes, quadrantFilter, yearRecords, maintenanceRecords, registryRecords, hoveredTube, viewMode, highlightTubes, showGridMarkers, showDisposalColors, showOldPlugs, showDNTOnly]);
 
 
+  useEffect(() => {
+    return () => {
+      if (hoverHideTimerRef.current) window.clearTimeout(hoverHideTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!editingTarget) return;
+    const dlg = noteDialogRef.current;
+    if (dlg && !dlg.open) {
+      dlg.showModal();
+    }
+    const targetRef = editingTarget.activeMode === 'after' && editingTarget.hasAfter
+      ? afterTextareaRef
+      : beforeTextareaRef;
+    targetRef.current?.focus();
+  }, [editingTarget]);
+
+  const openNoteEditor = (tube: any) => {
+    if (!currentYear) return;
+    setIsPlaying(false); // 編輯時暫停自動播放並鎖定年份與模式
+    const { systemDntTag, userNote } = splitSystemDntNote(yearRecords[tube.id]?.notes);
+    setEditBeforeNote(userNote);
+    setEditAfterNote(maintenanceRecords[tube.id]?.notes || '');
+    setNoteSaveError('');
+    setEditingTarget({
+      tube,
+      year: currentYear,
+      hasAfter: hasAfterData,
+      activeMode: viewMode,
+      systemDntTag,
+    });
+  };
+
+  const handleSaveTubeNote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingTarget) return;
+
+    const { tube, year, hasAfter, systemDntTag } = editingTarget;
+    const finalBefore = buildCombinedBeforeNote(systemDntTag, editBeforeNote);
+    const finalAfter = editAfterNote.trim();
+
+    setNoteSaving(true);
+    setNoteSaveError('');
+
+    try {
+      const payload: Record<string, any> = {
+        unit_id: unitId,
+        year,
+        zone: tube.zone,
+        row_num: tube.row,
+        col_num: tube.col,
+        before_notes: finalBefore,
+      };
+      if (hasAfter) {
+        payload.after_notes = finalAfter;
+      }
+
+      const res = await fetch(`${import.meta.env.BASE_URL}api/notes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        throw new Error(result.error || '儲存備註失敗');
+      }
+
+      setYearRecords(prev => {
+        const next = { ...prev };
+        const existing = next[tube.id];
+        if (existing) {
+          next[tube.id] = { ...existing, notes: finalBefore || null };
+        } else if (finalBefore) {
+          next[tube.id] = {
+            unit_id: unitId,
+            year,
+            zone: tube.zone,
+            row_num: tube.row,
+            col_num: tube.col,
+            code: 'NDD',
+            size_val: 0,
+            notes: finalBefore,
+          };
+        }
+        return next;
+      });
+
+      if (hasAfter) {
+        setMaintenanceRecords(prev => {
+          const next = { ...prev };
+          const existing = next[tube.id];
+          if (existing) {
+            next[tube.id] = { ...existing, notes: finalAfter || null };
+          } else if (finalAfter) {
+            next[tube.id] = {
+              unit_id: unitId,
+              year,
+              zone: tube.zone,
+              row_num: tube.row,
+              col_num: tube.col,
+              action: 'KEP',
+              notes: finalAfter,
+            };
+          }
+          return next;
+        });
+      }
+
+      noteDialogRef.current?.close();
+    } catch (err: any) {
+      setNoteSaveError(err.message || '儲存失敗，請稍後再試');
+    } finally {
+      setNoteSaving(false);
+    }
+  };
+
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    if (hoverHideTimerRef.current) {
+      window.clearTimeout(hoverHideTimerRef.current);
+      hoverHideTimerRef.current = null;
+    }
+
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    setMousePos({ x: e.clientX, y: e.clientY });
 
     if (tubes.length === 0) return;
 
@@ -643,6 +802,8 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     const offsetY = rect.height / 2 - ((maxY + minY) / 2) * scale;
 
     let closest: any | null = null;
+    let closestCx = 0;
+    let closestCy = 0;
     let minDist = Infinity;
 
     filteredTubes.forEach(tube => {
@@ -653,10 +814,17 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       if (dist < scale && dist < minDist) {
         minDist = dist;
         closest = tube;
+        closestCx = cx;
+        closestCy = cy;
       }
     });
 
-    setHoveredTube(closest);
+    if (closest) {
+      setMousePos({ x: rect.left + closestCx, y: rect.top + closestCy });
+      setHoveredTube(closest);
+    } else if (!isTooltipHoveredRef.current) {
+      setHoveredTube(null);
+    }
   };
 
   const handleQuadrantChange = (q: string) => {
@@ -685,11 +853,18 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       const res = await fetch(`${import.meta.env.BASE_URL}api/maintenance/upload`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records, password: pass, unit_id: unitId, year: currentYear })
+        body: JSON.stringify({
+          records,
+          password: pass,
+          unit_id: unitId,
+          year: currentYear,
+          notes_mode: uploadNotesMode,
+        })
       });
       const result = await res.json();
       if (!res.ok) {
         if (res.status === 403 && result.requirePassword) {
+          setUploadExistingNotesCount(result.existingNotesCount || 0);
           setUploadStatus('password_required');
           setUploadMessage(result.error || '覆寫需要密碼');
           return;
@@ -700,6 +875,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       setUploadMessage(`成功！${result.message}`);
       setPendingUploadRecords([]);
       setUploadPassword('');
+      setUploadExistingNotesCount(0);
       // 重新載入處置資料
       if (currentYear) {
         fetch(`${import.meta.env.BASE_URL}api/maintenance?unit_id=${unitId}&year=${currentYear}`)
@@ -980,7 +1156,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
             {/* 情境 A/B 二選一 */}
             {currentYear && !maintenanceYears.includes(currentYear) ? (
               <button
-                onClick={() => { setShowUploadModal(true); setUploadStatus('idle'); setUploadMessage(''); setPendingUploadRecords([]); }}
+                onClick={() => { setShowUploadModal(true); setUploadStatus('idle'); setUploadMessage(''); setPendingUploadRecords([]); setUploadExistingNotesCount(0); }}
                 className="flex items-center gap-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium px-4 py-1.5 rounded-md transition"
               >
                 <Upload size={15} /> 快速上傳處置方向
@@ -1077,13 +1253,48 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
             )}
 
             {uploadStatus === 'password_required' && (
-              <div className="flex items-center gap-2 mb-3">
-                <Lock size={14} className="text-yellow-400"/>
-                <input
-                  type="password" placeholder="覆寫密碼" value={uploadPassword}
-                  onChange={e => setUploadPassword(e.target.value)}
-                  className="flex-1 bg-slate-800 border border-yellow-600 rounded-md px-3 py-1.5 text-sm text-white"
-                />
+              <div className="space-y-3 mb-3">
+                {uploadExistingNotesCount > 0 && (
+                  <fieldset className="bg-amber-950/30 border border-amber-600/40 rounded-lg p-3 space-y-2">
+                    <legend className="text-xs font-semibold text-amber-300 px-1">
+                      備註覆蓋檢查（目前共有 {uploadExistingNotesCount} 筆非空白處置備註）
+                    </legend>
+                    <div className="flex items-start gap-2">
+                      <input
+                        id="quick-upload-notes-merge"
+                        name="quickUploadNotesMode"
+                        type="radio"
+                        checked={uploadNotesMode === 'merge'}
+                        onChange={() => setUploadNotesMode('merge')}
+                        className="mt-1 accent-blue-500"
+                      />
+                      <label htmlFor="quick-upload-notes-merge" className="text-xs text-slate-200 cursor-pointer">
+                        合併保留既有備註（保留手動備註與僅含備註的保留管）
+                      </label>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <input
+                        id="quick-upload-notes-overwrite"
+                        name="quickUploadNotesMode"
+                        type="radio"
+                        checked={uploadNotesMode === 'overwrite'}
+                        onChange={() => setUploadNotesMode('overwrite')}
+                        className="mt-1 accent-red-500"
+                      />
+                      <label htmlFor="quick-upload-notes-overwrite" className="text-xs text-slate-300 cursor-pointer">
+                        完全覆蓋（以新上傳檔案為準）
+                      </label>
+                    </div>
+                  </fieldset>
+                )}
+                <div className="flex items-center gap-2">
+                  <Lock size={14} className="text-yellow-400"/>
+                  <input
+                    type="password" placeholder="覆寫密碼" value={uploadPassword}
+                    onChange={e => setUploadPassword(e.target.value)}
+                    className="flex-1 bg-slate-800 border border-yellow-600 rounded-md px-3 py-1.5 text-sm text-white"
+                  />
+                </div>
               </div>
             )}
 
@@ -1414,7 +1625,19 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
             ref={canvasRef} 
             className="w-full h-full cursor-crosshair"
             onMouseMove={handleMouseMove}
-            onMouseLeave={() => setHoveredTube(null)}
+            onClick={() => {
+              if (hoveredTube && currentYear) {
+                openNoteEditor(hoveredTube);
+              }
+            }}
+            onMouseLeave={() => {
+              if (hoverHideTimerRef.current) window.clearTimeout(hoverHideTimerRef.current);
+              hoverHideTimerRef.current = window.setTimeout(() => {
+                if (!isTooltipHoveredRef.current) {
+                  setHoveredTube(null);
+                }
+              }, 150);
+            }}
           />
           
           {isRendering && (
@@ -1426,8 +1649,19 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
 
           {hoveredTube && (
             <div 
-              className="fixed z-50 bg-slate-800 border border-slate-700 text-slate-200 p-4 rounded-lg shadow-xl text-sm pointer-events-none transform -translate-x-1/2 -translate-y-full mt-[-10px] min-w-[280px]"
+              className="fixed z-50 bg-slate-800 border border-slate-700 text-slate-200 p-4 rounded-lg shadow-xl text-sm pointer-events-auto transform -translate-x-1/2 -translate-y-full mt-[-8px] min-w-[290px] max-w-[360px]"
               style={{ left: mousePos.x, top: mousePos.y }}
+              onMouseEnter={() => {
+                isTooltipHoveredRef.current = true;
+                if (hoverHideTimerRef.current) {
+                  window.clearTimeout(hoverHideTimerRef.current);
+                  hoverHideTimerRef.current = null;
+                }
+              }}
+              onMouseLeave={() => {
+                isTooltipHoveredRef.current = false;
+                setHoveredTube(null);
+              }}
             >
               <div className="font-bold text-base mb-2 border-b border-slate-700 pb-1 text-white flex justify-between">
                 <span>位置: {hoveredTube.zone} / 行 {hoveredTube.row} / 列 {hoveredTube.col}</span>
@@ -1450,8 +1684,8 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                 <span>{registryRecords[hoveredTube.id]?.status === 'plugged' ? '已塞管' : '正常'}</span>
               </div>
               
-              <div className="pt-1">
-                <div className="font-semibold mb-1 text-blue-400 leading-none">檢測結果 ({currentYear || '無'})</div>
+              <div className="pt-1 space-y-2">
+                <div className="font-semibold text-blue-400 leading-none">檢測結果 ({currentYear || '無'})</div>
                 {yearRecords[hoveredTube.id] ? (
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm bg-slate-900/50 p-2 rounded">
                     <span className="text-slate-400">瑕疵碼:</span>
@@ -1459,19 +1693,27 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                     <span className="text-slate-400">深度 (%):</span>
                     <span className="font-bold">{yearRecords[hoveredTube.id].size_val?.toFixed(1) || '0.0'}</span>
                     
-                    {yearRecords[hoveredTube.id].notes && (
-                      <>
-                        <span className="text-slate-400 mt-1">備註:</span>
-                        <span className="text-amber-400 text-xs mt-1 self-center leading-tight">{yearRecords[hoveredTube.id].notes}</span>
-                      </>
-                    )}
+                    <span className="text-slate-400 mt-1">檢測備註 (Before):</span>
+                    <span className={`text-xs mt-1 self-center leading-tight break-words ${yearRecords[hoveredTube.id].notes ? 'text-amber-400' : 'text-slate-500'}`}>
+                      {yearRecords[hoveredTube.id].notes || '無'}
+                    </span>
                     
-                    {viewMode === 'after' && (
+                    {(viewMode === 'after' || hasAfterData) && (
                       <>
-                         <span className="text-slate-400 mt-1">實際處置:</span>
-                         <span className={`font-mono mt-1 font-bold ${maintenanceRecords[hoveredTube.id]?.action ? 'text-emerald-400' : 'text-slate-500'}`}>
-                           {maintenanceRecords[hoveredTube.id]?.action || '無特別處置'}
-                         </span>
+                        <span className="text-slate-400 mt-1">實際處置:</span>
+                        <span className={`font-mono mt-1 font-bold ${
+                          maintenanceRecords[hoveredTube.id]?.action && maintenanceRecords[hoveredTube.id]?.action !== 'KEP'
+                            ? 'text-emerald-400'
+                            : 'text-slate-400'
+                        }`}>
+                          {maintenanceRecords[hoveredTube.id]?.action === 'KEP'
+                            ? '無特別處置 (保留)'
+                            : (maintenanceRecords[hoveredTube.id]?.action || '無特別處置')}
+                        </span>
+                        <span className="text-slate-400 mt-1">處置備註 (After):</span>
+                        <span className={`text-xs mt-1 self-center leading-tight break-words ${maintenanceRecords[hoveredTube.id]?.notes ? 'text-emerald-300' : 'text-slate-500'}`}>
+                          {maintenanceRecords[hoveredTube.id]?.notes || '無'}
+                        </span>
                       </>
                     )}
 
@@ -1485,13 +1727,129 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                     )}
                   </div>
                 ) : (
-                  <div className="text-slate-500 italic p-2 text-xs">此年份無檢測紀錄</div>
+                  <div className="text-slate-500 italic p-2 text-xs bg-slate-900/50 rounded">此年份無檢測紀錄</div>
+                )}
+
+                {currentYear && (
+                  <div className="pt-1 flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-400">可點擊管束或按鈕編輯</span>
+                    <button
+                      type="button"
+                      onClick={() => openNoteEditor(hoveredTube)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors"
+                    >
+                      <Pencil size={12} aria-hidden="true" />
+                      編輯備註
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
           )}
         </div>
       </div>
+
+      {/* 單支管備註編輯 Modal (<dialog>) */}
+      <dialog
+        ref={noteDialogRef}
+        aria-labelledby="note-dialog-title"
+        onClose={() => {
+          setEditingTarget(null);
+          setNoteSaveError('');
+        }}
+        className="m-auto w-full max-w-md rounded-2xl bg-slate-900 border border-slate-700 text-slate-200 p-0 shadow-2xl backdrop:bg-black/60 backdrop:backdrop-blur-sm"
+      >
+        {editingTarget && (
+          <form onSubmit={handleSaveTubeNote} className="p-6 space-y-4">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
+              <div>
+                <h3 id="note-dialog-title" className="text-lg font-bold text-white flex items-center gap-2">
+                  <Pencil size={18} className="text-blue-400" aria-hidden="true" />
+                  編輯管束備註
+                </h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  {unitId} / {editingTarget.tube.zone} 區 / 行 {editingTarget.tube.row} / 列 {editingTarget.tube.col} — {editingTarget.year} 年
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => noteDialogRef.current?.close()}
+                aria-label="關閉視窗"
+                className="p-1 text-slate-400 hover:text-white rounded"
+              >
+                <X size={20} aria-hidden="true" />
+              </button>
+            </div>
+
+            {editingTarget.systemDntTag && (
+              <div className="bg-blue-950/40 border border-blue-700/50 rounded-lg px-3 py-2 text-xs text-blue-300">
+                系統自動標記（固定保留）：<span className="font-mono font-semibold">{editingTarget.systemDntTag}</span>
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <label htmlFor="edit-before-note" className="block text-sm font-medium text-blue-300">
+                檢測結果 (Before) 備註
+              </label>
+              <textarea
+                ref={beforeTextareaRef}
+                id="edit-before-note"
+                name="beforeNote"
+                rows={3}
+                value={editBeforeNote}
+                onChange={(e) => setEditBeforeNote(e.target.value)}
+                placeholder="輸入該年份檢測階段的備註（留空即清除）"
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
+              />
+            </div>
+
+            {editingTarget.hasAfter ? (
+              <div className="space-y-1.5">
+                <label htmlFor="edit-after-note" className="block text-sm font-medium text-emerald-300">
+                  大修處置後 (After) 備註
+                </label>
+                <textarea
+                  ref={afterTextareaRef}
+                  id="edit-after-note"
+                  name="afterNote"
+                  rows={3}
+                  value={editAfterNote}
+                  onChange={(e) => setEditAfterNote(e.target.value)}
+                  placeholder="輸入該年份大修處置後的備註（留空即清除）"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                />
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500 bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2">
+                {editingTarget.year} 年尚無大修處置紀錄，目前僅開放編輯檢測結果 (Before) 備註。
+              </p>
+            )}
+
+            {noteSaveError && (
+              <p role="alert" className="text-xs text-red-400 bg-red-950/30 border border-red-800/50 rounded-lg px-3 py-2">
+                {noteSaveError}
+              </p>
+            )}
+
+            <div className="flex justify-end gap-3 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => noteDialogRef.current?.close()}
+                className="px-4 py-2 text-sm text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={noteSaving}
+                className="px-5 py-2 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
+              >
+                {noteSaving ? '儲存中...' : '儲存備註'}
+              </button>
+            </div>
+          </form>
+        )}
+      </dialog>
     </div>
   );
 }

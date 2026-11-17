@@ -73,11 +73,12 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
           if (mainAction) {
             if (mainAction.action === 'PLG' || mainAction.action === '塞管') { isPlugged = true; }
             else if (mainAction.action === 'RPL' || mainAction.action === '換管') { isPlugged = false; isReplaced = true; depth = 0; code = 'NDD'; }
-            if (mainAction.notes) notes = mainAction.notes;
           } else if (maintenanceRes.length === 0) {
             if (depth > 50) isPlugged = true;
             if (code === 'COR') isPlugged = true;
           }
+          // After 模式僅取處置紀錄的備註，避免與 Before 檢測備註合併混淆
+          notes = mainAction?.notes || '';
         }
         map.set(id, { id, zone: r.zone, depth, isPlugged, isReplaced, code, notes });
       });
@@ -132,7 +133,8 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
           currentDepth: curr.isPlugged ? 100 : curr.depth,
           status: curr.isPlugged ? 'Plugged' : 'Normal',
           thinningRate, defectType: curr.code,
-          notes: curr.notes || prev.notes || '',
+          prevNotes: prev.notes || '',
+          currNotes: curr.notes || '',
           isAnomaly, anomalyType, anomalyReason
         });
       });
@@ -180,7 +182,8 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
         '狀態': d.isAnomaly ? '邏輯異常' : d.status === 'Plugged' ? '已塞管' : '正常',
         '成長率 (%)': d.isAnomaly ? d.anomalyReason : d.thinningRate.toFixed(2),
         '缺陷類型': d.defectType,
-        '備註': d.notes
+        [`${labelStr(previousSelection)} 備註`]: d.prevNotes,
+        [`${labelStr(currentSelection)} 備註`]: d.currNotes
       };
     }));
     const wb = XLSX.utils.book_new();
