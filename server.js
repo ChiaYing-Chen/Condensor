@@ -31,7 +31,7 @@ const pool = new Pool({
 const pimcpPool = new Pool({
   user: process.env.DB_USER,
   host: process.env.DB_HOST,
-  database: process.env.PIMCP_DB_NAME || 'pimcp',
+  database: process.env.PIMCP_DB_NAME || 'PIMCP',
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
 });
@@ -642,7 +642,24 @@ const checkCondensorAdmin = async (userInput) => {
       };
     }
   } catch (err) {
-    console.error('checkCondensorAdmin error:', err.message);
+    console.error('checkCondensorAdmin DB error:', err.message);
+    try {
+      const pimcpPort = process.env.PIMCP_PORT || 3011;
+      const apiRes = await fetch(
+        `http://127.0.0.1:${pimcpPort}/api/app-permissions/condensor/${encodeURIComponent(shortId)}`,
+        { headers: { 'x-remote-user': shortId } }
+      );
+      if (apiRes.ok) {
+        const apiJson = await apiRes.json();
+        return {
+          isAdmin: Boolean(apiJson?.data?.isAdmin),
+          userId: String(apiJson?.data?.userId || shortId),
+          userName: raw,
+        };
+      }
+    } catch (apiErr) {
+      console.error('checkCondensorAdmin HTTP fallback error:', apiErr.message);
+    }
   }
   return { isAdmin: false, userId: shortId, userName: raw };
 };
