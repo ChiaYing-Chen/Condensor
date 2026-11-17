@@ -1,7 +1,18 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
-import { Play, Pause, SkipBack, SkipForward, Layers, Loader2, Download, Table2, Image as ImageIcon, Upload, Palette, Eye, EyeOff, X, Lock, Pencil } from 'lucide-react';
+import { Play, Pause, SkipBack, SkipForward, Layers, Loader2, Download, Table2, Image as ImageIcon, Upload, Palette, Eye, EyeOff, X, Lock, Pencil, ShieldCheck, AlertTriangle } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { generateTubeMap } from '../utils/tubeMapGenerator';
+
+const INSPECTION_CODE_OPTIONS = [
+  { code: 'NDD', label: 'NDD - 無缺陷' },
+  { code: 'PIT', label: 'PIT - 內部孔蝕' },
+  { code: 'COR', label: 'COR - 外部氨腐蝕' },
+  { code: 'DNT', label: 'DNT - 管凹陷' },
+  { code: 'PLG', label: 'PLG - 塞管' },
+  { code: 'BLK', label: 'BLK - 堵管' },
+  { code: 'RST', label: 'RST - 無法檢測' },
+  { code: 'OBS', label: 'OBS - 待觀察' },
+] as const;
 
 function splitSystemDntNote(rawNote?: string | null): { systemDntTag: string; userNote: string } {
   if (!rawNote) return { systemDntTag: '', userNote: '' };
@@ -144,11 +155,21 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     hasAfter: boolean;
     activeMode: ViewMode;
     systemDntTag: string;
+    origCode: string;
+    origDepth: number;
   } | null>(null);
+  const [editCode, setEditCode] = useState('NDD');
+  const [editDepth, setEditDepth] = useState('0');
   const [editBeforeNote, setEditBeforeNote] = useState('');
   const [editAfterNote, setEditAfterNote] = useState('');
+  const [confirmingValueChange, setConfirmingValueChange] = useState(false);
   const [noteSaving, setNoteSaving] = useState(false);
   const [noteSaveError, setNoteSaveError] = useState('');
+  const [currentUserInfo, setCurrentUserInfo] = useState<{
+    userId: string;
+    userName: string;
+    isAdmin: boolean;
+  }>({ userId: '', userName: '訪客', isAdmin: false });
 
   // 閨牍動畫相關 ref
   const blinkPhaseRef = useRef<boolean>(true); // true = 顯示, false = 隱藏
@@ -640,8 +661,102 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   }, [tubes, quadrantFilter, yearRecords, maintenanceRecords, registryRecords, hoveredTube, viewMode, highlightTubes, showGridMarkers, showDisposalColors, showOldPlugs, showDNTOnly]);
 
 
+  const resolveCurrentUserPermission = async (candidateUser?: string) => {
+    let identifier = String(candidateUser || '').trim();
+
+    if (!identifier) {
+      try {
+        const whoamiRes = await fetch('/PIMCP/api/auth/whoami', { credentials: 'include' });
+        if (whoamiRes.ok) {
+          const whoamiData = await whoamiRes.json();
+          const iisUser = String(whoamiData?.iisUser || '').trim();
+          if (iisUser && iisUser.toLowerCase() !== 'guest') {
+            identifier = iisUser;
+          }
+        }
+      } catch {
+        // 略過，繼續嘗試其他身分探測
+      }
+    }
+
+    if (!identifier) {
+      try {
+        const aspxRes = await fetch(`/PIMCP/whoami.aspx?t=${Date.now()}`, { credentials: 'include' });
+        if (aspxRes.ok) {
+          const aspxData = await aspxRes.json();
+          const rawName = String(aspxData?.raw || aspxData?.username || '').trim();
+          if (rawName && rawName !== '匿名') {
+            identifier = rawName;
+          }
+        }
+      } catch {
+        // 略過
+      }
+    }
+
+    if (!identifier) {
+      const cached =
+        localStorage.getItem('unified_user_name') ||
+        localStorage.getItem('pages_manual_user') ||
+        localStorage.getItem('appUserName') ||
+        '';
+      if (cached && cached !== '匿名') {
+        identifier = cached;
+      }
+    }
+
+    if (!identifier) {
+      setCurrentUserInfo({ userId: '', userName: '訪客', isAdmin: false });
+      return;
+    }
+
+    try {
+      const permRes = await fetch(
+        `${import.meta.env.BASE_URL}api/permissions/check?user=${encodeURIComponent(identifier)}`
+      );
+      if (permRes.ok) {
+        const permData = await permRes.json();
+        setCurrentUserInfo({
+          userId: permData.userId || identifier,
+          userName: permData.userName || identifier,
+          isAdmin: Boolean(permData.isAdmin),
+        });
+        return;
+      }
+    } catch {
+      // 嘗試透過 PIMCP API 確認權限
+    }
+
+    const shortId = identifier.split('\\').pop()?.trim() || identifier;
+    try {
+      const pimcpPermRes = await fetch(`/PIMCP/api/app-permissions/condensor/${encodeURIComponent(shortId)}`, {
+        credentials: 'include',
+      });
+      if (pimcpPermRes.ok) {
+        const pimcpData = await pimcpPermRes.json();
+        setCurrentUserInfo({
+          userId: shortId,
+          userName: identifier,
+          isAdmin: Boolean(pimcpData?.data?.isAdmin),
+        });
+        return;
+      }
+    } catch {
+      // 無法取得授權狀態時維持一般使用者權限
+    }
+
+    setCurrentUserInfo({ userId: shortId, userName: identifier, isAdmin: false });
+  };
+
   useEffect(() => {
+    resolveCurrentUserPermission();
+    const handleUserChange = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      resolveCurrentUserPermission(detail?.userId || detail?.username);
+    };
+    window.addEventListener('unified-user-changed', handleUserChange);
     return () => {
+      window.removeEventListener('unified-user-changed', handleUserChange);
       if (hoverHideTimerRef.current) window.clearTimeout(hoverHideTimerRef.current);
     };
   }, []);
@@ -661,9 +776,15 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   const openNoteEditor = (tube: any) => {
     if (!currentYear) return;
     setIsPlaying(false); // 編輯時暫停自動播放並鎖定年份與模式
+    resolveCurrentUserPermission();
     const { systemDntTag, userNote } = splitSystemDntNote(yearRecords[tube.id]?.notes);
+    const origCode = String(yearRecords[tube.id]?.code || 'NDD').trim().toUpperCase();
+    const origDepth = Number(yearRecords[tube.id]?.size_val) || 0;
+    setEditCode(origCode);
+    setEditDepth(String(origDepth));
     setEditBeforeNote(userNote);
     setEditAfterNote(maintenanceRecords[tube.id]?.notes || '');
+    setConfirmingValueChange(false);
     setNoteSaveError('');
     setEditingTarget({
       tube,
@@ -671,6 +792,8 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       hasAfter: hasAfterData,
       activeMode: viewMode,
       systemDntTag,
+      origCode,
+      origDepth,
     });
   };
 
@@ -678,9 +801,33 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     e.preventDefault();
     if (!editingTarget) return;
 
-    const { tube, year, hasAfter, systemDntTag } = editingTarget;
+    const { tube, year, hasAfter, systemDntTag, origCode, origDepth } = editingTarget;
     const finalBefore = buildCombinedBeforeNote(systemDntTag, editBeforeNote);
     const finalAfter = editAfterNote.trim();
+    const normalizedCode = editCode.trim().toUpperCase();
+    const parsedDepth = parseFloat(editDepth);
+
+    const isValueModified =
+      normalizedCode !== origCode ||
+      Math.abs((Number.isNaN(parsedDepth) ? -1 : parsedDepth) - origDepth) > 0.001;
+
+    if (isValueModified) {
+      if (Number.isNaN(parsedDepth) || parsedDepth < 0 || parsedDepth > 100) {
+        setNoteSaveError('瑕疵深度必須為 0 ~ 100 之間的數字');
+        setConfirmingValueChange(false);
+        return;
+      }
+      if (!currentUserInfo.isAdmin) {
+        setNoteSaveError('權限不足：僅 Condensor 專案管理人員可修改瑕疵碼與深度');
+        setConfirmingValueChange(false);
+        return;
+      }
+      if (!confirmingValueChange) {
+        setNoteSaveError('');
+        setConfirmingValueChange(true);
+        return;
+      }
+    }
 
     setNoteSaving(true);
     setNoteSaveError('');
@@ -694,6 +841,12 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
         col_num: tube.col,
         before_notes: finalBefore,
       };
+      if (isValueModified) {
+        payload.code = normalizedCode;
+        payload.size_val = parsedDepth;
+        payload.operator = currentUserInfo.userId || currentUserInfo.userName;
+        payload.confirm_inspection_change = true;
+      }
       if (hasAfter) {
         payload.after_notes = finalAfter;
       }
@@ -705,24 +858,33 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       });
       const result = await res.json();
       if (!res.ok) {
-        throw new Error(result.error || '儲存備註失敗');
+        throw new Error(result.error || '儲存失敗');
       }
+
+      const persistedCode = result.code ?? origCode;
+      const persistedDepth = result.size_val ?? origDepth;
+      const persistedBeforeNote = result.before_notes !== undefined ? result.before_notes : finalBefore;
 
       setYearRecords(prev => {
         const next = { ...prev };
         const existing = next[tube.id];
         if (existing) {
-          next[tube.id] = { ...existing, notes: finalBefore || null };
-        } else if (finalBefore) {
+          next[tube.id] = {
+            ...existing,
+            code: persistedCode,
+            size_val: persistedDepth,
+            notes: persistedBeforeNote || null,
+          };
+        } else if (persistedBeforeNote || isValueModified) {
           next[tube.id] = {
             unit_id: unitId,
             year,
             zone: tube.zone,
             row_num: tube.row,
             col_num: tube.col,
-            code: 'NDD',
-            size_val: 0,
-            notes: finalBefore,
+            code: persistedCode,
+            size_val: persistedDepth,
+            notes: persistedBeforeNote || null,
           };
         }
         return next;
@@ -1749,106 +1911,217 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
         </div>
       </div>
 
-      {/* 單支管備註編輯 Modal (<dialog>) */}
+      {/* 單支管備註與複檢編輯 Modal (<dialog>) */}
       <dialog
         ref={noteDialogRef}
         aria-labelledby="note-dialog-title"
         onClose={() => {
           setEditingTarget(null);
+          setConfirmingValueChange(false);
           setNoteSaveError('');
         }}
         className="m-auto w-full max-w-md rounded-2xl bg-slate-900 border border-slate-700 text-slate-200 p-0 shadow-2xl backdrop:bg-black/60 backdrop:backdrop-blur-sm"
       >
-        {editingTarget && (
-          <form onSubmit={handleSaveTubeNote} className="p-6 space-y-4">
-            <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
-              <div>
-                <h3 id="note-dialog-title" className="text-lg font-bold text-white flex items-center gap-2">
-                  <Pencil size={18} className="text-blue-400" aria-hidden="true" />
-                  編輯管束備註
-                </h3>
-                <p className="text-xs text-slate-400 mt-1">
-                  {unitId} / {editingTarget.tube.zone} 區 / 行 {editingTarget.tube.row} / 列 {editingTarget.tube.col} — {editingTarget.year} 年
-                </p>
+        {editingTarget && (() => {
+          const parsedDepth = parseFloat(editDepth);
+          const isValueModified =
+            editCode.trim().toUpperCase() !== editingTarget.origCode ||
+            Math.abs((Number.isNaN(parsedDepth) ? -1 : parsedDepth) - editingTarget.origDepth) > 0.001;
+          const hasCustomCode = !INSPECTION_CODE_OPTIONS.some(opt => opt.code === editCode);
+
+          return (
+            <form onSubmit={handleSaveTubeNote} className="p-6 space-y-4">
+              <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
+                <div>
+                  <h3 id="note-dialog-title" className="text-lg font-bold text-white flex items-center gap-2">
+                    <Pencil size={18} className="text-blue-400" aria-hidden="true" />
+                    編輯管束資料與備註
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-1">
+                    {unitId} / {editingTarget.tube.zone} 區 / 行 {editingTarget.tube.row} / 列 {editingTarget.tube.col} — {editingTarget.year} 年
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => noteDialogRef.current?.close()}
+                  aria-label="關閉視窗"
+                  className="p-1 text-slate-400 hover:text-white rounded"
+                >
+                  <X size={20} aria-hidden="true" />
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => noteDialogRef.current?.close()}
-                aria-label="關閉視窗"
-                className="p-1 text-slate-400 hover:text-white rounded"
-              >
-                <X size={20} aria-hidden="true" />
-              </button>
-            </div>
 
-            {editingTarget.systemDntTag && (
-              <div className="bg-blue-950/40 border border-blue-700/50 rounded-lg px-3 py-2 text-xs text-blue-300">
-                系統自動標記（固定保留）：<span className="font-mono font-semibold">{editingTarget.systemDntTag}</span>
+              <div className={`flex items-center gap-2 rounded-lg px-3 py-2 text-xs border ${
+                currentUserInfo.isAdmin
+                  ? 'bg-emerald-950/30 border-emerald-700/50 text-emerald-300'
+                  : 'bg-slate-950/60 border-slate-800 text-slate-400'
+              }`}>
+                <ShieldCheck size={15} className={currentUserInfo.isAdmin ? 'text-emerald-400 shrink-0' : 'text-slate-500 shrink-0'} aria-hidden="true" />
+                <span>
+                  {currentUserInfo.isAdmin
+                    ? `管理人員已授權：${currentUserInfo.userName} (${currentUserInfo.userId}) — 可修改瑕疵碼、深度與備註`
+                    : `目前登入：${currentUserInfo.userName} — 僅編輯備註（改瑕疵碼/深度需管理人員授權）`}
+                </span>
               </div>
-            )}
 
-            <div className="space-y-1.5">
-              <label htmlFor="edit-before-note" className="block text-sm font-medium text-blue-300">
-                檢測結果 (Before) 備註
-              </label>
-              <textarea
-                ref={beforeTextareaRef}
-                id="edit-before-note"
-                name="beforeNote"
-                rows={3}
-                value={editBeforeNote}
-                onChange={(e) => setEditBeforeNote(e.target.value)}
-                placeholder="輸入該年份檢測階段的備註（留空即清除）"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
-              />
-            </div>
+              <div className="grid grid-cols-2 gap-3 bg-slate-950/50 border border-slate-800 rounded-lg p-3">
+                <div className="space-y-1">
+                  <label htmlFor="edit-tube-code" className="block text-xs font-medium text-slate-300">
+                    瑕疵碼 (Code)
+                  </label>
+                  <select
+                    id="edit-tube-code"
+                    name="inspectionCode"
+                    value={editCode}
+                    disabled={!currentUserInfo.isAdmin}
+                    onChange={(e) => {
+                      setEditCode(e.target.value);
+                      setConfirmingValueChange(false);
+                      setNoteSaveError('');
+                    }}
+                    className="w-full bg-slate-900 border border-slate-700 disabled:opacity-60 disabled:cursor-not-allowed rounded-lg px-2.5 py-2 text-xs text-blue-300 font-mono focus:outline-none focus:border-blue-500"
+                  >
+                    {hasCustomCode && <option value={editCode}>{editCode}</option>}
+                    {INSPECTION_CODE_OPTIONS.map(opt => (
+                      <option key={opt.code} value={opt.code}>{opt.label}</option>
+                    ))}
+                  </select>
+                </div>
 
-            {editingTarget.hasAfter ? (
+                <div className="space-y-1">
+                  <label htmlFor="edit-tube-depth" className="block text-xs font-medium text-slate-300">
+                    瑕疵深度 (%)
+                  </label>
+                  <input
+                    id="edit-tube-depth"
+                    name="inspectionDepth"
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="100"
+                    value={editDepth}
+                    disabled={!currentUserInfo.isAdmin}
+                    onChange={(e) => {
+                      setEditDepth(e.target.value);
+                      setConfirmingValueChange(false);
+                      setNoteSaveError('');
+                    }}
+                    className="w-full bg-slate-900 border border-slate-700 disabled:opacity-60 disabled:cursor-not-allowed rounded-lg px-2.5 py-2 text-xs text-white font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              {editingTarget.systemDntTag && (
+                <div className="bg-blue-950/40 border border-blue-700/50 rounded-lg px-3 py-2 text-xs text-blue-300">
+                  系統自動標記（固定保留）：<span className="font-mono font-semibold">{editingTarget.systemDntTag}</span>
+                </div>
+              )}
+
               <div className="space-y-1.5">
-                <label htmlFor="edit-after-note" className="block text-sm font-medium text-emerald-300">
-                  大修處置後 (After) 備註
+                <label htmlFor="edit-before-note" className="block text-sm font-medium text-blue-300">
+                  檢測結果 (Before) 備註
                 </label>
                 <textarea
-                  ref={afterTextareaRef}
-                  id="edit-after-note"
-                  name="afterNote"
+                  ref={beforeTextareaRef}
+                  id="edit-before-note"
+                  name="beforeNote"
                   rows={3}
-                  value={editAfterNote}
-                  onChange={(e) => setEditAfterNote(e.target.value)}
-                  placeholder="輸入該年份大修處置後的備註（留空即清除）"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  value={editBeforeNote}
+                  onChange={(e) => setEditBeforeNote(e.target.value)}
+                  placeholder="輸入該年份檢測階段的備註（留空即清除）"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500"
                 />
               </div>
-            ) : (
-              <p className="text-xs text-slate-500 bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2">
-                {editingTarget.year} 年尚無大修處置紀錄，目前僅開放編輯檢測結果 (Before) 備註。
-              </p>
-            )}
 
-            {noteSaveError && (
-              <p role="alert" className="text-xs text-red-400 bg-red-950/30 border border-red-800/50 rounded-lg px-3 py-2">
-                {noteSaveError}
-              </p>
-            )}
+              {editingTarget.hasAfter ? (
+                <div className="space-y-1.5">
+                  <label htmlFor="edit-after-note" className="block text-sm font-medium text-emerald-300">
+                    大修處置後 (After) 備註
+                  </label>
+                  <textarea
+                    ref={afterTextareaRef}
+                    id="edit-after-note"
+                    name="afterNote"
+                    rows={3}
+                    value={editAfterNote}
+                    onChange={(e) => setEditAfterNote(e.target.value)}
+                    placeholder="輸入該年份大修處置後的備註（留空即清除）"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+              ) : (
+                <p className="text-xs text-slate-500 bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2">
+                  {editingTarget.year} 年尚無大修處置紀錄，目前僅開放編輯檢測結果 (Before) 備註。
+                </p>
+              )}
 
-            <div className="flex justify-end gap-3 pt-2 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => noteDialogRef.current?.close()}
-                className="px-4 py-2 text-sm text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
-              >
-                取消
-              </button>
-              <button
-                type="submit"
-                disabled={noteSaving}
-                className="px-5 py-2 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
-              >
-                {noteSaving ? '儲存中...' : '儲存備註'}
-              </button>
-            </div>
-          </form>
-        )}
+              {confirmingValueChange && isValueModified && (
+                <div role="status" className="bg-amber-950/40 border border-amber-500/60 rounded-xl p-3.5 space-y-1.5 text-xs">
+                  <div className="font-bold text-amber-300 flex items-center gap-1.5">
+                    <AlertTriangle size={15} className="shrink-0" aria-hidden="true" />
+                    變更內容確認（將影響處置篩選與塞管統計）
+                  </div>
+                  <div className="text-slate-300">
+                    管束位置：<span className="font-mono text-white">{unitId} / {editingTarget.tube.zone}-{editingTarget.tube.row}-{editingTarget.tube.col} ({editingTarget.year} 年)</span>
+                  </div>
+                  <div className="text-slate-300">
+                    瑕疵碼：<span className="font-mono text-slate-400">{editingTarget.origCode}</span> ➔ <span className="font-mono font-bold text-amber-300">{editCode}</span>
+                  </div>
+                  <div className="text-slate-300">
+                    瑕疵深度：<span className="font-mono text-slate-400">{editingTarget.origDepth.toFixed(1)}%</span> ➔ <span className="font-mono font-bold text-amber-300">{Number.isNaN(parsedDepth) ? '-' : `${parsedDepth.toFixed(1)}%`}</span>
+                  </div>
+                  <div className="text-amber-200/80 pt-1">
+                    系統將自動附加複檢修正留痕至檢測備註，請確認無誤後再送出。
+                  </div>
+                </div>
+              )}
+
+              {noteSaveError && (
+                <p role="alert" className="text-xs text-red-400 bg-red-950/30 border border-red-800/50 rounded-lg px-3 py-2">
+                  {noteSaveError}
+                </p>
+              )}
+
+              <div className="flex justify-end gap-3 pt-2 border-t border-slate-800">
+                {confirmingValueChange && isValueModified ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingValueChange(false)}
+                      className="px-4 py-2 text-sm text-slate-300 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
+                    >
+                      返回修改
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={noteSaving}
+                      className="px-5 py-2 text-sm bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
+                    >
+                      {noteSaving ? '變更中...' : '同意並確認變更'}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => noteDialogRef.current?.close()}
+                      className="px-4 py-2 text-sm text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={noteSaving}
+                      className="px-5 py-2 text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-medium rounded-lg transition-colors"
+                    >
+                      {noteSaving ? '儲存中...' : isValueModified ? '檢視變更確認' : '儲存備註'}
+                    </button>
+                  </>
+                )}
+              </div>
+            </form>
+          );
+        })()}
       </dialog>
     </div>
   );

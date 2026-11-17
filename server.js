@@ -28,6 +28,17 @@ const pool = new Pool({
   port: process.env.DB_PORT,
 });
 
+const pimcpPool = new Pool({
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.PIMCP_DB_NAME || 'pimcp',
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
+});
+pimcpPool.on('error', (err) => {
+  console.error('⚠️  PIMCP PostgreSQL Pool Error (non-fatal):', err.message);
+});
+
 // Utility to normalize year (民國 → 西元)
 const normalizeYear = (yearStr) => {
   const y = parseInt(yearStr, 10);
@@ -565,7 +576,7 @@ app.post('/api/records/upload', async (req, res) => {
   }
 });
 
-const syncUploadHistoryNotes = async (uid, dataType, targetYear, zoneUpper, rNum, cNum, dbNote, defaultRow) => {
+const syncUploadHistoryRecord = async (uid, dataType, targetYear, zoneUpper, rNum, cNum, patchFields, defaultRow) => {
   const histRes = await pool.query(
     `SELECT id, records_snapshot FROM upload_history
      WHERE unit_id = $1 AND data_type = $2 AND year = $3
@@ -580,20 +591,84 @@ const syncUploadHistoryNotes = async (uid, dataType, targetYear, zoneUpper, rNum
            Number(r.col_num) === cNum
     );
     if (idx >= 0) {
-      snapshot[idx] = { ...snapshot[idx], notes: dbNote };
-    } else if (dbNote !== null) {
+      snapshot[idx] = { ...snapshot[idx], ...patchFields };
+    } else if (defaultRow) {
       snapshot.push(defaultRow);
     }
+    const summary = {};
+    snapshot.forEach(r => {
+      const key = dataType === 'maintenance' ? (r.action || 'PLG') : (r.code || 'NDD');
+      summary[key] = (summary[key] || 0) + 1;
+    });
     await pool.query(
-      'UPDATE upload_history SET records_snapshot = $1, record_count = $2 WHERE id = $3',
-      [JSON.stringify(snapshot), snapshot.length, histRes.rows[0].id]
+      'UPDATE upload_history SET records_snapshot = $1, record_count = $2, action_summary = $3 WHERE id = $4',
+      [JSON.stringify(snapshot), snapshot.length, JSON.stringify(summary), histRes.rows[0].id]
     );
   }
 };
 
-// --- Notes (單支管備註新增/修改，區分 Before 檢測紀錄與 After 處置紀錄) ---
+const checkCondensorAdmin = async (userInput) => {
+  const raw = String(userInput || '').trim();
+  if (!raw || raw === '匿名' || raw.toLowerCase() === 'guest') {
+    return { isAdmin: false, userId: '', userName: raw || '匿名' };
+  }
+  const shortId = raw.split('\\').pop().trim();
+  try {
+    const res = await pimcpPool.query(
+      `SELECT u.user_id, u.name
+       FROM app_admin_permissions p
+       JOIN org_users u ON LOWER(u.user_id) = LOWER(p.user_id)
+       WHERE LOWER(p.app_id) = 'condensor'
+         AND (LOWER(p.user_id) = LOWER($1) OR LOWER(u.user_id) = LOWER($1) OR u.name = $1 OR u.name = $2)
+       LIMIT 1`,
+      [shortId, raw]
+    );
+    if (res.rows.length > 0) {
+      return {
+        isAdmin: true,
+        userId: String(res.rows[0].user_id),
+        userName: String(res.rows[0].name),
+      };
+    }
+    const userRes = await pimcpPool.query(
+      `SELECT user_id, name FROM org_users WHERE LOWER(user_id) = LOWER($1) OR name = $1 OR name = $2 LIMIT 1`,
+      [shortId, raw]
+    );
+    if (userRes.rows.length > 0) {
+      return {
+        isAdmin: false,
+        userId: String(userRes.rows[0].user_id),
+        userName: String(userRes.rows[0].name),
+      };
+    }
+  } catch (err) {
+    console.error('checkCondensorAdmin error:', err.message);
+  }
+  return { isAdmin: false, userId: shortId, userName: raw };
+};
+
+// 查詢使用者是否為 Condensor 專案管理人員（來源為 PIMCP app_admin_permissions）
+app.get('/api/permissions/check', async (req, res) => {
+  const candidate = req.query.user || req.query.clientUser || '';
+  const info = await checkCondensorAdmin(candidate);
+  res.json({ success: true, ...info });
+});
+
+// --- Notes & Single-Tube Inspection Revision (單支管備註與管理人員複檢修改) ---
 app.post('/api/notes', async (req, res) => {
-  const { unit_id, year, zone, row_num, col_num, before_notes, after_notes } = req.body || {};
+  const {
+    unit_id,
+    year,
+    zone,
+    row_num,
+    col_num,
+    before_notes,
+    after_notes,
+    code,
+    size_val,
+    operator,
+    confirm_inspection_change,
+  } = req.body || {};
   const uid = unit_id || 'TG-1';
   const targetYear = parseInt(year, 10);
   const rNum = parseInt(row_num, 10);
@@ -603,41 +678,97 @@ app.post('/api/notes', async (req, res) => {
   if (!zoneStr || Number.isNaN(targetYear) || Number.isNaN(rNum) || Number.isNaN(cNum)) {
     return res.status(400).json({ error: '缺少有效的管束座標或年份參數' });
   }
-  if (before_notes === undefined && after_notes === undefined) {
-    return res.status(400).json({ error: '未提供要更新的備註內容' });
+  if (before_notes === undefined && after_notes === undefined && code === undefined && size_val === undefined) {
+    return res.status(400).json({ error: '未提供要更新的內容' });
   }
 
   const zoneUpper = zoneStr.toUpperCase();
+  let savedCode;
+  let savedSizeVal;
+  let savedBeforeNotes = before_notes !== undefined ? (typeof before_notes === 'string' ? before_notes.trim() : '') : undefined;
 
   try {
     await pool.query('BEGIN');
 
-    if (before_notes !== undefined) {
-      const noteText = typeof before_notes === 'string' ? before_notes.trim() : '';
+    if (before_notes !== undefined || code !== undefined || size_val !== undefined) {
+      const existingInspRes = await pool.query(
+        `SELECT code, size_val, notes FROM inspection_records
+         WHERE unit_id = $1 AND year = $2 AND UPPER(BTRIM(zone)) = $3 AND row_num = $4 AND col_num = $5
+         LIMIT 1`,
+        [uid, targetYear, zoneUpper, rNum, cNum]
+      );
+      const oldInsp = existingInspRes.rows[0] || { code: 'NDD', size_val: 0, notes: null };
+      const oldCode = String(oldInsp.code || 'NDD').trim().toUpperCase();
+      const oldSize = Number(oldInsp.size_val) || 0;
+      const nextCode = code !== undefined ? String(code).trim().toUpperCase() : oldCode;
+      const nextSize = size_val !== undefined ? Number(size_val) : oldSize;
+
+      if (size_val !== undefined && (Number.isNaN(nextSize) || nextSize < 0 || nextSize > 100)) {
+        await pool.query('ROLLBACK');
+        return res.status(400).json({ error: '瑕疵深度必須介於 0 ~ 100% 之間' });
+      }
+
+      const isValueModified =
+        (code !== undefined && nextCode !== oldCode) ||
+        (size_val !== undefined && Math.abs(nextSize - oldSize) > 0.001);
+
+      let noteText = before_notes !== undefined
+        ? (typeof before_notes === 'string' ? before_notes.trim() : '')
+        : (oldInsp.notes ? String(oldInsp.notes).trim() : '');
+
+      if (isValueModified) {
+        const authInfo = await checkCondensorAdmin(operator || req.query.clientUser);
+        if (!authInfo.isAdmin) {
+          await pool.query('ROLLBACK');
+          return res.status(403).json({ error: '權限不足：僅 Condensor 專案管理人員可修改檢測瑕疵碼與深度' });
+        }
+        if (!confirm_inspection_change) {
+          await pool.query('ROLLBACK');
+          return res.status(400).json({ error: '請先確認檢測數值變更內容後再送出' });
+        }
+        const auditTag = `[複檢修正(${authInfo.userName}): 原 ${oldCode} ${oldSize.toFixed(1)}% → ${nextCode} ${nextSize.toFixed(1)}%]`;
+        noteText = mergeNoteStrings(noteText, auditTag);
+      }
+
       const dbNote = noteText || null;
+      savedCode = nextCode;
+      savedSizeVal = nextSize;
+      savedBeforeNotes = noteText;
+
       const updateRes = await pool.query(
         `UPDATE inspection_records
-         SET notes = $1
-         WHERE unit_id = $2 AND year = $3 AND zone = $4 AND row_num = $5 AND col_num = $6`,
-        [dbNote, uid, targetYear, zoneStr, rNum, cNum]
+         SET code = $1, size_val = $2, notes = $3
+         WHERE unit_id = $4 AND year = $5 AND UPPER(BTRIM(zone)) = $6 AND row_num = $7 AND col_num = $8`,
+        [nextCode, nextSize, dbNote, uid, targetYear, zoneUpper, rNum, cNum]
       );
-      if (updateRes.rowCount === 0 && dbNote !== null) {
+      if (updateRes.rowCount === 0 && (dbNote !== null || isValueModified)) {
         await pool.query(
           `INSERT INTO inspection_records (unit_id, year, zone, row_num, col_num, code, size_val, notes)
-           VALUES ($1, $2, $3, $4, $5, 'NDD', 0, $6)`,
-          [uid, targetYear, zoneStr, rNum, cNum, dbNote]
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [uid, targetYear, zoneUpper, rNum, cNum, nextCode, nextSize, dbNote]
         );
       }
-      await syncUploadHistoryNotes(uid, 'inspection', targetYear, zoneUpper, rNum, cNum, dbNote, {
-        year: targetYear,
-        zone: zoneUpper,
-        row_num: rNum,
-        col_num: cNum,
-        channel: null,
-        code: 'NDD',
-        size_val: 0,
-        notes: dbNote
-      });
+      await syncUploadHistoryRecord(
+        uid,
+        'inspection',
+        targetYear,
+        zoneUpper,
+        rNum,
+        cNum,
+        { code: nextCode, size_val: nextSize, notes: dbNote },
+        dbNote !== null || isValueModified
+          ? {
+              year: targetYear,
+              zone: zoneUpper,
+              row_num: rNum,
+              col_num: cNum,
+              channel: null,
+              code: nextCode,
+              size_val: nextSize,
+              notes: dbNote,
+            }
+          : null
+      );
     }
 
     if (after_notes !== undefined) {
@@ -646,8 +777,8 @@ app.post('/api/notes', async (req, res) => {
       const updateRes = await pool.query(
         `UPDATE maintenance_actions
          SET notes = $1
-         WHERE unit_id = $2 AND year = $3 AND zone = $4 AND row_num = $5 AND col_num = $6`,
-        [dbNote, uid, targetYear, zoneStr, rNum, cNum]
+         WHERE unit_id = $2 AND year = $3 AND UPPER(BTRIM(zone)) = $4 AND row_num = $5 AND col_num = $6`,
+        [dbNote, uid, targetYear, zoneUpper, rNum, cNum]
       );
       if (updateRes.rowCount === 0 && dbNote !== null) {
         // 僅當該年份已有處置紀錄時才補寫 KEP，避免讓尚未大修的年份被判定為已有處置
@@ -662,24 +793,37 @@ app.post('/api/notes', async (req, res) => {
         await pool.query(
           `INSERT INTO maintenance_actions (unit_id, year, zone, row_num, col_num, action, notes)
            VALUES ($1, $2, $3, $4, $5, 'KEP', $6)`,
-          [uid, targetYear, zoneStr, rNum, cNum, dbNote]
+          [uid, targetYear, zoneUpper, rNum, cNum, dbNote]
         );
       }
-      await syncUploadHistoryNotes(uid, 'maintenance', targetYear, zoneUpper, rNum, cNum, dbNote, {
-        year: targetYear,
-        zone: zoneUpper,
-        row_num: rNum,
-        col_num: cNum,
-        action: 'KEP',
-        new_material: null,
-        notes: dbNote
-      });
+      await syncUploadHistoryRecord(
+        uid,
+        'maintenance',
+        targetYear,
+        zoneUpper,
+        rNum,
+        cNum,
+        { notes: dbNote },
+        dbNote !== null
+          ? {
+              year: targetYear,
+              zone: zoneUpper,
+              row_num: rNum,
+              col_num: cNum,
+              action: 'KEP',
+              new_material: null,
+              notes: dbNote,
+            }
+          : null
+      );
     }
 
     await pool.query('COMMIT');
     res.json({
       success: true,
-      before_notes: before_notes !== undefined ? (typeof before_notes === 'string' ? before_notes.trim() : '') : undefined,
+      code: savedCode,
+      size_val: savedSizeVal,
+      before_notes: savedBeforeNotes,
       after_notes: after_notes !== undefined ? (typeof after_notes === 'string' ? after_notes.trim() : '') : undefined,
     });
   } catch (error) {
