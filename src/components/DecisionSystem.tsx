@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings2, ShieldAlert, Wrench, AlertTriangle, Database, Plus, Trash2, Loader2, Play, Download, Save, Bookmark } from 'lucide-react';
+import { Settings2, ShieldAlert, Wrench, AlertTriangle, Database, Plus, Trash2, Loader2, Play, Download, Save, Bookmark, GitCompare } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
 interface DecisionSystemProps {
@@ -119,7 +119,28 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
   const [suggestedList, setSuggestedList] = useState<any[]>([]);
   const [warningList, setWarningList] = useState<any[]>([]);
   const [hasGeneratedWarning, setHasGeneratedWarning] = useState(false);
-  const [activeResultTab, setActiveResultTab] = useState<'disposal' | 'warning'>('disposal');
+  const [pastCurrentSelection, setPastCurrentSelection] = useState<string>('');
+  const [pastPreviousSelection, setPastPreviousSelection] = useState<string>('');
+  const [hasGeneratedCompare, setHasGeneratedCompare] = useState(false);
+  const [activeResultTab, setActiveResultTab] = useState<'disposal' | 'warning' | 'compare'>('disposal');
+  const [activeCompareCategory, setActiveCompareCategory] = useState<'hit' | 'unexpected' | 'watch'>('hit');
+  const [compareData, setCompareData] = useState<{
+    pastWarningCount: number;
+    currDisposalCount: number;
+    hitList: any[];
+    unexpectedList: any[];
+    watchList: any[];
+    stillWarningCount: number;
+    earlyHandledCount: number;
+  }>({
+    pastWarningCount: 0,
+    currDisposalCount: 0,
+    hitList: [],
+    unexpectedList: [],
+    watchList: [],
+    stillWarningCount: 0,
+    earlyHandledCount: 0,
+  });
 
   const warningInputRef = useRef<HTMLInputElement>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -178,6 +199,24 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
          setLoading(false);
       });
   }, [unitData]);
+
+  useEffect(() => {
+    if (!previousSelection || availableYears.length === 0) return;
+    const [baseYearStr] = previousSelection.split('-');
+    const baseYear = Number(baseYearStr);
+    if (!baseYear) return;
+
+    // 前期預警檢測狀態預設為基準年份的「大修檢測基準 (before)」
+    const defaultPastCurr = `${baseYear}-before`;
+    setPastCurrentSelection(defaultPastCurr);
+
+    // 前期預警基準狀態預設為比 baseYear 更早一期的年份（優先取 after）
+    const olderYear = availableYears.find(y => y < baseYear) ?? baseYear;
+    const defaultPastPrev = maintenanceYears.includes(olderYear)
+      ? `${olderYear}-after`
+      : `${olderYear}-before`;
+    setPastPreviousSelection(defaultPastPrev);
+  }, [previousSelection, availableYears, maintenanceYears]);
 
   const fetchStateData = async (selection: string, unitId: string) => {
     if (!selection) return new Map();
@@ -290,11 +329,83 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     }
   };
 
-  const runAnalysis = async (targetMode: 'disposal' | 'warning' = 'disposal') => {
+  const evaluateCycle = (
+    currMap: Map<string, any>,
+    prevMap: Map<string, any>,
+    cycleYear: number,
+    activeRules: Rule[],
+    trimmedWarning: string,
+    shouldEvalWarning: boolean,
+    tubeMap: Map<string, any>,
+    commissionYear: number
+  ) => {
+    const suggestions: any[] = [];
+    const warnings: any[] = [];
+    const suggestionMap = new Map<string, any>();
+    const warningMap = new Map<string, any>();
+    const currentYear = new Date().getFullYear();
+
+    currMap.forEach((curr, id) => {
+      // 已經被塞管的，或因為大修已被判定 PLG 就不算異常管了
+      if (curr.isPlugged) return;
+
+      const prev = prevMap.get(id);
+      const this_depth = curr.depth;
+      const prev_depth = prev ? prev.depth : 0;
+      const Code = curr.code;
+      const depth_Diff = this_depth > prev_depth ? (this_depth - prev_depth) : 0;
+
+      const tubeMeta = tubeMap.get(id);
+      const installYear = tubeMeta?.install_year || commissionYear;
+      const TubeAge = cycleYear > 0 ? (cycleYear - installYear) : (currentYear - installYear);
+
+      const context = { TubeAge, depth_Diff, this_depth, previous_depth: prev_depth, Code };
+
+      const matchedRules: string[] = [];
+      activeRules.forEach((rule, index) => {
+        if (evaluateRule(rule.formula, context)) {
+          matchedRules.push(`規則 ${index + 1}: ${rule.formula}`);
+        }
+      });
+
+      if (matchedRules.length > 0) {
+        const item = {
+          id,
+          quadrant: curr.zone,
+          TubeAge,
+          this_depth,
+          depth_Diff,
+          Code,
+          reasons: matchedRules,
+        };
+        suggestions.push(item);
+        suggestionMap.set(id, item);
+      } else if (shouldEvalWarning && evaluateRule(trimmedWarning, context)) {
+        // 排除上方篩選規則後，仍符合警示條件的管束列入警示清單
+        const item = {
+          id,
+          quadrant: curr.zone,
+          TubeAge,
+          this_depth,
+          depth_Diff,
+          Code,
+          reasons: [`警示條件: ${trimmedWarning}`],
+        };
+        warnings.push(item);
+        warningMap.set(id, item);
+      }
+    });
+
+    suggestions.sort((a, b) => b.this_depth - a.this_depth);
+    warnings.sort((a, b) => b.this_depth - a.this_depth);
+    return { suggestions, warnings, suggestionMap, warningMap };
+  };
+
+  const runAnalysis = async (targetMode: 'disposal' | 'warning' | 'compare' = 'disposal') => {
     if (!currentSelection || !previousSelection) return;
 
     const trimmedWarning = warningFormula.trim();
-    if (targetMode === 'warning') {
+    if (targetMode === 'warning' || targetMode === 'compare') {
       if (!trimmedWarning) {
         setWarningFormulaError('請輸入警示條件公式');
         warningInputRef.current?.focus();
@@ -311,90 +422,167 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     setAnalyzing(true);
 
     try {
-      const [currMap, prevMap] = await Promise.all([
-        fetchStateData(currentSelection, unitData.unit_id),
-        fetchStateData(previousSelection, unitData.unit_id)
+      const shouldRunCompare =
+        (targetMode === 'compare' || hasGeneratedCompare) &&
+        Boolean(pastCurrentSelection) &&
+        Boolean(pastPreviousSelection) &&
+        isFormulaSyntaxValid(trimmedWarning);
+
+      const [[currMap, prevMap], pastMaps] = await Promise.all([
+        Promise.all([
+          fetchStateData(currentSelection, unitData.unit_id),
+          fetchStateData(previousSelection, unitData.unit_id)
+        ]),
+        shouldRunCompare
+          ? Promise.all([
+              fetchStateData(pastCurrentSelection, unitData.unit_id),
+              fetchStateData(pastPreviousSelection, unitData.unit_id)
+            ])
+          : Promise.resolve<[Map<string, any>, Map<string, any>] | null>(null)
       ]);
 
       const activeRules = rules.filter(r => r.enabled && r.formula.trim().length > 0);
-      const suggestions: any[] = [];
-      const warnings: any[] = [];
       const shouldEvaluateWarning =
-        (targetMode === 'warning' || hasGeneratedWarning) && isFormulaSyntaxValid(trimmedWarning);
-      const currentYear = new Date().getFullYear();
-      
+        (targetMode === 'warning' || targetMode === 'compare' || hasGeneratedWarning || hasGeneratedCompare) &&
+        isFormulaSyntaxValid(trimmedWarning);
+
       const commissionYear = unitData.commission_year || 2018;
       const [currYearStr] = currentSelection.split('-');
       const latestYear = Number(currYearStr);
 
       const tubeMap = new Map();
       if (Array.isArray(tubesData)) {
-         tubesData.forEach(t => {
-           tubeMap.set(`${t.zone}-${t.row_num}-${t.col_num}`, t);
-         });
+        tubesData.forEach(t => {
+          tubeMap.set(`${t.zone}-${t.row_num}-${t.col_num}`, t);
+        });
       }
 
-      currMap.forEach((curr, id) => {
-        // 已經被塞管的，或因為大修已被判定 PLG 就不算異常管了
-        if (curr.isPlugged) return;
+      const currCycle = evaluateCycle(
+        currMap,
+        prevMap,
+        latestYear,
+        activeRules,
+        trimmedWarning,
+        shouldEvaluateWarning,
+        tubeMap,
+        commissionYear
+      );
 
-        const prev = prevMap.get(id);
-        const this_depth = curr.depth;
-        const prev_depth = prev ? prev.depth : 0;
-        const Code = curr.code;
-        
-        const depth_Diff = this_depth > prev_depth ? (this_depth - prev_depth) : 0;
-        
-        const tubeMeta = tubeMap.get(id);
-        const installYear = tubeMeta?.install_year || commissionYear;
-        const TubeAge = latestYear > 0 ? (latestYear - installYear) : (currentYear - installYear);
-
-        const context = { TubeAge, depth_Diff, this_depth, previous_depth: prev_depth, Code };
-
-        const matchedRules: string[] = [];
-        activeRules.forEach((rule, index) => {
-          if (evaluateRule(rule.formula, context)) {
-            matchedRules.push(`規則 ${index + 1}: ${rule.formula}`);
-          }
-        });
-
-        if (matchedRules.length > 0) {
-          suggestions.push({
-            id,
-            quadrant: curr.zone,
-            TubeAge,
-            this_depth,
-            depth_Diff,
-            Code,
-            reasons: matchedRules
-          });
-        } else if (shouldEvaluateWarning && evaluateRule(trimmedWarning, context)) {
-          // 排除上方篩選規則後，仍符合警示條件的管束列入警示清單
-          warnings.push({
-            id,
-            quadrant: curr.zone,
-            TubeAge,
-            this_depth,
-            depth_Diff,
-            Code,
-            reasons: [`警示條件: ${trimmedWarning}`]
-          });
-        }
-      });
-
-      setSuggestedList(suggestions.sort((a, b) => b.this_depth - a.this_depth));
+      setSuggestedList(currCycle.suggestions);
       if (shouldEvaluateWarning) {
-        setWarningList(warnings.sort((a, b) => b.this_depth - a.this_depth));
+        setWarningList(currCycle.warnings);
       }
       if (targetMode === 'warning') {
         setHasGeneratedWarning(true);
       }
+
+      if (shouldRunCompare && pastMaps) {
+        const [pastCurrMap, pastPrevMap] = pastMaps;
+        const [pastYearStr] = pastCurrentSelection.split('-');
+        const pastYear = Number(pastYearStr);
+
+        const pastCycle = evaluateCycle(
+          pastCurrMap,
+          pastPrevMap,
+          pastYear,
+          activeRules,
+          trimmedWarning,
+          true,
+          tubeMap,
+          commissionYear
+        );
+
+        const hitList: any[] = [];
+        const unexpectedList: any[] = [];
+        const watchList: any[] = [];
+        let stillWarningCount = 0;
+        let earlyHandledCount = 0;
+
+        currCycle.suggestions.forEach(item => {
+          const pastWarn = pastCycle.warningMap.get(item.id);
+          if (pastWarn) {
+            hitList.push({
+              ...item,
+              past_depth: pastWarn.this_depth,
+              curr_depth: item.this_depth,
+              cross_diff: item.this_depth - pastWarn.this_depth,
+              statusLabel: '預警命中',
+            });
+          } else {
+            const pastRaw = pastCurrMap.get(item.id);
+            const pastDepth = pastRaw ? pastRaw.depth : 0;
+            unexpectedList.push({
+              ...item,
+              past_depth: pastDepth,
+              curr_depth: item.this_depth,
+              cross_diff: item.this_depth - pastDepth,
+              statusLabel: '突發處置（前期未警示）',
+            });
+          }
+        });
+
+        pastCycle.warnings.forEach(pastItem => {
+          if (currCycle.suggestionMap.has(pastItem.id)) return;
+          const currRaw = currMap.get(pastItem.id);
+          const prevRaw = prevMap.get(pastItem.id);
+          const isStillWarn = currCycle.warningMap.has(pastItem.id);
+          const currDepth = currRaw ? currRaw.depth : 0;
+          const isPluggedNow = Boolean(currRaw?.isPlugged || prevRaw?.isPlugged);
+
+          let outcome = '未達處置與警示門檻';
+          if (isPluggedNow) {
+            outcome = '前期已塞管處置';
+            earlyHandledCount++;
+          } else if (prevRaw?.isReplaced || (currRaw && currRaw.depth < pastItem.this_depth - 15)) {
+            outcome = '前期已換管 / 深度降低';
+            earlyHandledCount++;
+          } else if (isStillWarn) {
+            outcome = '持續警示（劣化平緩）';
+            stillWarningCount++;
+          }
+
+          watchList.push({
+            ...pastItem,
+            past_depth: pastItem.this_depth,
+            curr_depth: currDepth,
+            this_depth: currDepth,
+            cross_diff: currDepth - pastItem.this_depth,
+            isPluggedNow,
+            statusLabel: outcome,
+            reasons: [outcome],
+          });
+        });
+
+        hitList.sort((a, b) => b.curr_depth - a.curr_depth);
+        unexpectedList.sort((a, b) => b.curr_depth - a.curr_depth);
+        watchList.sort((a, b) => b.past_depth - a.past_depth);
+
+        setCompareData({
+          pastWarningCount: pastCycle.warnings.length,
+          currDisposalCount: currCycle.suggestions.length,
+          hitList,
+          unexpectedList,
+          watchList,
+          stillWarningCount,
+          earlyHandledCount,
+        });
+        if (targetMode === 'compare') {
+          setHasGeneratedCompare(true);
+        }
+      }
+
       setActiveResultTab(targetMode);
     } catch (e) {
       console.error(e);
     } finally {
       setAnalyzing(false);
     }
+  };
+
+  const formatSelectionLabel = (sel: string) => {
+    if (!sel) return '-';
+    const [y, m] = sel.split('-');
+    return `${y}(${m === 'after' ? '大修後' : '檢測基準'})`;
   };
 
   const exportRowsToExcel = (
@@ -431,6 +619,49 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
     XLSX.writeFile(wb, fileName);
+  };
+
+  const exportCompareToExcel = () => {
+    if (!hasGeneratedCompare) return;
+    const wb = XLSX.utils.book_new();
+    const buildSheet = (list: any[], sheetName: string) => {
+      const rows = list.map(item => {
+        const parts = item.id.split('-');
+        return {
+          '區域': parts[0] || '',
+          '行/Row': Number(parts[1]) || parts[1] || '',
+          '列/Col': Number(parts[2]) || parts[2] || '',
+          '管齡(年)': item.TubeAge,
+          '前期深度(%)': parseFloat(item.past_depth.toFixed(1)),
+          '本次深度(%)': item.isPluggedNow ? '已塞管' : parseFloat(item.curr_depth.toFixed(1)),
+          '跨期變化(%)': item.isPluggedNow ? '-' : parseFloat(item.cross_diff.toFixed(1)),
+          '分類狀態': item.statusLabel,
+          '觸發條件 / 目前去向': item.reasons.map(formatReasonForExcel).join(' | '),
+        };
+      });
+      const ws = XLSX.utils.json_to_sheet(
+        rows.length > 0
+          ? rows
+          : [{ '區域': '無符合資料', '行/Row': '', '列/Col': '', '管齡(年)': '', '前期深度(%)': '', '本次深度(%)': '', '跨期變化(%)': '', '分類狀態': '', '觸發條件 / 目前去向': '' }]
+      );
+      ws['!cols'] = [
+        { wch: 8 },
+        { wch: 8 },
+        { wch: 8 },
+        { wch: 10 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 24 },
+        { wch: 60 },
+      ];
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    };
+
+    buildSheet(compareData.hitList, '1_預警命中');
+    buildSheet(compareData.unexpectedList, '2_突發處置');
+    buildSheet(compareData.watchList, '3_緩慢劣化與已處理');
+    XLSX.writeFile(wb, `${unitData.unit_id}_預警追蹤比對.xlsx`);
   };
 
   if (!unitData || !unitData.unit_id) {
@@ -637,6 +868,15 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                 {analyzing ? <Loader2 size={18} className="animate-spin" /> : <AlertTriangle size={18} />}
                 {analyzing ? '警示運算中...' : '產出警示清單'}
               </button>
+              <button
+                type="button"
+                onClick={() => runAnalysis('compare')}
+                disabled={analyzing}
+                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors disabled:opacity-50"
+              >
+                {analyzing ? <Loader2 size={18} className="animate-spin" /> : <GitCompare size={18} />}
+                {analyzing ? '比對運算中...' : '預警追蹤比對'}
+              </button>
             </div>
 
             <div className="text-xs text-slate-400 font-mono bg-slate-950 p-3 rounded">
@@ -688,7 +928,7 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
             aria-label="篩選結果清單"
             className="flex overflow-x-auto border-b border-slate-800 mb-5 gap-2"
             onKeyDown={(e) => {
-              const tabOrder: Array<'disposal' | 'warning'> = ['disposal', 'warning'];
+              const tabOrder: Array<'disposal' | 'warning' | 'compare'> = ['disposal', 'warning', 'compare'];
               const currentIdx = tabOrder.indexOf(activeResultTab);
               let nextIdx = currentIdx;
               if (e.key === 'ArrowRight') nextIdx = (currentIdx + 1) % tabOrder.length;
@@ -739,6 +979,26 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
               <span>警示清單</span>
               <span className="text-xs px-2 py-0.5 rounded-full bg-amber-900/30 text-amber-400">
                 {warningList.length}
+              </span>
+            </button>
+            <button
+              ref={(el) => { tabRefs.current[2] = el; }}
+              type="button"
+              role="tab"
+              id="tab-compare"
+              aria-selected={activeResultTab === 'compare'}
+              tabIndex={activeResultTab === 'compare' ? 0 : -1}
+              onClick={() => setActiveResultTab('compare')}
+              className={`relative flex-none pb-3 px-4 text-sm font-semibold flex items-center gap-2 transition-colors whitespace-nowrap focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400 ${
+                activeResultTab === 'compare'
+                  ? "text-white after:content-[''] after:absolute after:inset-x-0 after:bottom-0 after:border-b-2 after:border-indigo-400"
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <GitCompare size={16} className="text-indigo-400" aria-hidden="true" />
+              <span>預警追蹤比對</span>
+              <span className="text-xs px-2 py-0.5 rounded-full bg-indigo-900/30 text-indigo-300">
+                {hasGeneratedCompare ? `${compareData.hitList.length}/${compareData.currDisposalCount}` : '比對'}
               </span>
             </button>
           </div>
@@ -868,6 +1128,264 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
               </div>
             </div>
           ))}
+
+          <div
+            role="tabpanel"
+            aria-labelledby="tab-compare"
+            hidden={activeResultTab !== 'compare'}
+          >
+            {/* 前期預警週期選擇列 */}
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 border border-slate-800 rounded-lg p-3 mb-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="flex items-center gap-2">
+                  <label htmlFor="past-curr-select" className="text-xs font-medium text-slate-300 whitespace-nowrap">
+                    前期預警檢測:
+                  </label>
+                  <select
+                    id="past-curr-select"
+                    value={pastCurrentSelection}
+                    onChange={(e) => setPastCurrentSelection(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 text-slate-200 rounded px-2.5 py-1 text-xs font-medium focus:border-indigo-500"
+                  >
+                    {availableYears.map(y => (
+                      <optgroup key={`past-curr-${y}`} label={`${y} 年份`}>
+                        {maintenanceYears.includes(y) && (
+                          <option value={`${y}-after`}>{y} (大修處理後)</option>
+                        )}
+                        <option value={`${y}-before`}>{y} (大修檢測基準)</option>
+                      </optgroup>
+                    ))}
+                  </select>
+                </div>
+                <span className="text-xs font-bold text-slate-500">VS</span>
+                <div className="flex items-center gap-2">
+                  <label htmlFor="past-prev-select" className="text-xs font-medium text-slate-300 whitespace-nowrap">
+                    前期預警基準:
+                  </label>
+                  <select
+                    id="past-prev-select"
+                    value={pastPreviousSelection}
+                    onChange={(e) => setPastPreviousSelection(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 text-slate-200 rounded px-2.5 py-1 text-xs font-medium focus:border-indigo-500"
+                  >
+                    {availableYears.map(y => (
+                      <optgroup key={`past-prev-${y}`} label={`${y} 年份`}>
+                        {maintenanceYears.includes(y) && (
+                          <option value={`${y}-after`}>{y} (大修處理後)</option>
+                        )}
+                        <option value={`${y}-before`}>{y} (大修檢測基準)</option>
+                      </optgroup>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => runAnalysis('compare')}
+                disabled={analyzing || !pastCurrentSelection || !pastPreviousSelection}
+                className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors"
+              >
+                {analyzing ? <Loader2 size={14} className="animate-spin" /> : <GitCompare size={14} />}
+                重新比對
+              </button>
+            </div>
+
+            {/* 三分類統計卡片 */}
+            {(() => {
+              const hitRate = compareData.pastWarningCount > 0
+                ? ((compareData.hitList.length / compareData.pastWarningCount) * 100).toFixed(1)
+                : '0.0';
+              const coverageRate = compareData.currDisposalCount > 0
+                ? ((compareData.hitList.length / compareData.currDisposalCount) * 100).toFixed(1)
+                : '0.0';
+              const unexpectedRate = compareData.currDisposalCount > 0
+                ? ((compareData.unexpectedList.length / compareData.currDisposalCount) * 100).toFixed(1)
+                : '0.0';
+
+              const cards = [
+                {
+                  key: 'hit' as const,
+                  title: '① 預警命中',
+                  subtitle: '過去警示 → 本次處置',
+                  count: compareData.hitList.length,
+                  detail: `預警轉化率 ${hitRate}% | 處置涵蓋率 ${coverageRate}%`,
+                  activeClass: 'border-emerald-500 bg-emerald-950/30',
+                  countClass: 'text-emerald-400',
+                },
+                {
+                  key: 'unexpected' as const,
+                  title: '② 突發處置',
+                  subtitle: '過去未警示 → 本次處置',
+                  count: compareData.unexpectedList.length,
+                  detail: `佔本次處置 ${unexpectedRate}%（非預期快速劣化）`,
+                  activeClass: 'border-red-500 bg-red-950/30',
+                  countClass: 'text-red-400',
+                },
+                {
+                  key: 'watch' as const,
+                  title: '③ 緩慢劣化 / 已處理',
+                  subtitle: '過去警示 → 本次未達處置',
+                  count: compareData.watchList.length,
+                  detail: `持續警示 ${compareData.stillWarningCount} 支 | 前期已處置 ${compareData.earlyHandledCount} 支`,
+                  activeClass: 'border-sky-500 bg-sky-950/30',
+                  countClass: 'text-sky-400',
+                },
+              ];
+
+              const activeCategoryMeta = cards.find(c => c.key === activeCompareCategory) || cards[0];
+              const activeCategoryItems =
+                activeCompareCategory === 'hit'
+                  ? compareData.hitList
+                  : activeCompareCategory === 'unexpected'
+                    ? compareData.unexpectedList
+                    : compareData.watchList;
+
+              return (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+                    {cards.map((card) => (
+                      <button
+                        key={card.key}
+                        type="button"
+                        aria-pressed={activeCompareCategory === card.key}
+                        onClick={() => setActiveCompareCategory(card.key)}
+                        className={`text-left p-3.5 rounded-xl border transition-all focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400 ${
+                          activeCompareCategory === card.key
+                            ? card.activeClass
+                            : 'border-slate-800 bg-slate-950/40 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-bold text-white">{card.title}</span>
+                          <span className={`text-xl font-bold tabular-nums ${card.countClass}`}>
+                            {card.count} <span className="text-xs font-normal text-slate-400">支</span>
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1">{card.subtitle}</div>
+                        <div className="text-[11px] text-slate-300 mt-2 pt-2 border-t border-slate-800/80">
+                          {card.detail}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div className="flex items-center gap-2">
+                      <GitCompare className="text-indigo-400" size={18} aria-hidden="true" />
+                      <h3 className="text-base font-semibold text-slate-100">
+                        {activeCategoryMeta.title}（{activeCategoryMeta.subtitle}）
+                      </h3>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      {onApplyToVisual && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const [sourceYearStr] = currentSelection.split('-');
+                            const [pastYearStr] = pastCurrentSelection.split('-');
+                            onApplyToVisual(
+                              activeCategoryItems.map(item => item.id),
+                              Number(sourceYearStr),
+                              Number(pastYearStr)
+                            );
+                          }}
+                          disabled={activeCategoryItems.length === 0}
+                          className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
+                          title="將此分類管束套用至動態視覺檢視畫布"
+                        >
+                          <Play size={14} /> 在視覺圖中檢視
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={exportCompareToExcel}
+                        disabled={!hasGeneratedCompare}
+                        className="text-xs bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
+                      >
+                        <Download size={14} /> 比對結果下載
+                      </button>
+                      <div className="text-sm font-medium px-3 py-1 rounded-full bg-indigo-900/20 text-indigo-300">
+                        共 {activeCategoryItems.length} 支
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    tabIndex={0}
+                    role="region"
+                    aria-label={`${activeCategoryMeta.title}明細`}
+                    className="overflow-x-auto max-h-[440px] overflow-y-auto custom-scrollbar focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400"
+                  >
+                    <table className="w-full text-left border-collapse">
+                      <thead className="sticky top-0 bg-slate-900 shadow-sm z-10">
+                        <tr className="bg-slate-800/50 border-y border-slate-800">
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">區域</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">行/Row</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">列/Col</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">管齡</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">
+                            前期深度 <span className="text-[11px] font-normal text-slate-500">{formatSelectionLabel(pastCurrentSelection)}</span>
+                          </th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">
+                            本次深度 <span className="text-[11px] font-normal text-slate-500">{formatSelectionLabel(currentSelection)}</span>
+                          </th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">跨期變化</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">本次觸發條件 / 目前去向</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {activeCategoryItems.map((item) => {
+                          const parts = item.id.split('-');
+                          const diffStr = item.isPluggedNow
+                            ? '-'
+                            : `${item.cross_diff >= 0 ? '+' : ''}${item.cross_diff.toFixed(1)}%`;
+                          return (
+                            <tr key={item.id} className="hover:bg-slate-800/50">
+                              <td className="py-3 px-4 text-sm font-bold text-blue-300">{parts[0]}</td>
+                              <td className="py-3 px-4 text-sm font-medium text-white">{parts[1]}</td>
+                              <td className="py-3 px-4 text-sm font-medium text-white">{parts[2]}</td>
+                              <td className="py-3 px-4 text-sm text-slate-300">{item.TubeAge} 年</td>
+                              <td className="py-3 px-4 text-sm font-medium text-amber-300">
+                                {item.past_depth.toFixed(1)}%
+                              </td>
+                              <td className={`py-3 px-4 text-sm font-bold ${
+                                item.isPluggedNow ? 'text-slate-400' : activeCategoryMeta.countClass
+                              }`}>
+                                {item.isPluggedNow ? '已塞管' : `${item.curr_depth.toFixed(1)}%`}
+                              </td>
+                              <td className={`py-3 px-4 text-sm font-bold ${
+                                item.isPluggedNow
+                                  ? 'text-slate-500'
+                                  : item.cross_diff > 0
+                                    ? 'text-amber-500'
+                                    : 'text-emerald-400'
+                              }`}>
+                                {diffStr}
+                              </td>
+                              <td className="py-3 px-4 text-xs text-slate-400 max-w-[240px]">
+                                <ul className="list-disc pl-4 space-y-0.5">
+                                  {item.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}
+                                </ul>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {activeCategoryItems.length === 0 && (
+                          <tr>
+                            <td colSpan={8} className="py-8 text-center text-slate-500">
+                              {hasGeneratedCompare
+                                ? '此分類目前無符合管束。'
+                                : '尚未執行預警追蹤比對，請點擊左側或上方「預警追蹤比對 / 重新比對」按鈕。'}
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
         </div>
       </div>
     </div>
