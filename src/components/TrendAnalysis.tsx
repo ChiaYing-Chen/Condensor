@@ -9,6 +9,13 @@ interface TrendAnalysisProps {
 
 const ZONES = ['ALL', 'IL', 'IR', 'OL', 'OR'];
 
+const ANOMALY_TYPE_LABELS: Record<string, string> = {
+  missing_plug: '塞子遺失',
+  sudden_plug: '突現塞管',
+  abnormal_decrease: '瑕疵率異常降低',
+  both_rst: '兩者比對皆RST',
+};
+
 const DIST_BUCKETS = [
   { label: '減少 0~14.9%',          color: 'text-purple-400',  bg: 'bg-purple-900/30',  test: (r: number) => r < 0 && r > -15 },
   { label: '無變化或微成長 (0~10%)',  color: 'text-emerald-400', bg: 'bg-emerald-900/20', test: (r: number) => r >= 0 && r <= 10 },
@@ -66,7 +73,7 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
         let isPlugged = r.code === 'PLG';
         let isReplaced = false;
         let depth = Number(r.size_val) || 0;
-        let code = r.code || 'NDD';
+        let code = String(r.code || 'NDD').trim().toUpperCase();
         let notes = r.notes || '';
         if (mode === 'after') {
           const mainAction = maintenanceRes.find(m => m.zone === r.zone && m.row_num === r.row_num && m.col_num === r.col_num);
@@ -118,6 +125,10 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
           isAnomaly = true; anomalyType = 'sudden_plug';
           thinningRate = 100 - prev.depth;
           anomalyReason = `基準未塞管 (${prev.depth.toFixed(1)}%)，本次已判定為塞管 (突現塞管)`;
+        } else if (prev.code === 'RST' && curr.code === 'RST') {
+          // 兩者比對皆 RST：前次與本次同一位置皆為 RST 且無處置，判斷不合理
+          isAnomaly = true; anomalyType = 'both_rst';
+          anomalyReason = '前次與本次同一位置 CODE 皆為 RST (無法檢測且無任何處置)';
         } else {
           thinningRate = curr.depth - prev.depth;
         }
@@ -158,9 +169,10 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
       const missingPlug = zoneData.filter(d => d.anomalyType === 'missing_plug').length;
       const suddenPlug = zoneData.filter(d => d.anomalyType === 'sudden_plug').length;
       const abnormalDecrease = zoneData.filter(d => d.anomalyType === 'abnormal_decrease').length;
-      const totalAnomalies = missingPlug + suddenPlug + abnormalDecrease;
+      const bothRst = zoneData.filter(d => d.anomalyType === 'both_rst').length;
+      const totalAnomalies = missingPlug + suddenPlug + abnormalDecrease + bothRst;
 
-      return { zone, dist, missingPlug, suddenPlug, abnormalDecrease, totalAnomalies, total: zoneData.length };
+      return { zone, dist, missingPlug, suddenPlug, abnormalDecrease, bothRst, totalAnomalies, total: zoneData.length };
     });
   }, [deltaData]);
 
@@ -201,7 +213,7 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
         '基準深度 (%)': d.prevDepth.toFixed(2),
         '本次深度 (%)': d.status === 'Normal' ? d.currentDepth.toFixed(2) : '已塞管',
         '成長率 (%)': d.thinningRate.toFixed(2),
-        '異常類型': d.anomalyType === 'missing_plug' ? '塞子遺失' : d.anomalyType === 'sudden_plug' ? '突現塞管' : '瑕疵率異常降低',
+        '異常類型': ANOMALY_TYPE_LABELS[d.anomalyType] || d.anomalyType,
         '異常說明': d.anomalyReason || `瑕疵率下降 ${Math.abs(d.thinningRate).toFixed(1)}%`
       };
     }));
@@ -360,7 +372,7 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
 
       {/* Zone Cards Grid */}
       <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-5 gap-4">
-        {zoneStats.map(({ zone, dist, missingPlug, suddenPlug, abnormalDecrease, totalAnomalies: zoneAnomaly, total }) => (
+        {zoneStats.map(({ zone, dist, missingPlug, suddenPlug, abnormalDecrease, bothRst, totalAnomalies: zoneAnomaly, total }) => (
           <div
             key={zone}
             className={`bg-slate-900 rounded-xl ${
@@ -409,6 +421,7 @@ export default function TrendAnalysis({ unitData, onApplyToVisual }: TrendAnalys
               <AnomalyRow label="塞子遺失" count={missingPlug} />
               <AnomalyRow label="突現塞管" count={suddenPlug} />
               <AnomalyRow label="瑕疵率異常降低 (≥15%)" count={abnormalDecrease} />
+              <AnomalyRow label="兩者比對皆RST" count={bothRst} />
             </div>
           </div>
         ))}
