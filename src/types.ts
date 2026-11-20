@@ -41,3 +41,22 @@ export interface MaintenancePolicy {
   pluggingThreshold: number; // e.g., 60 for >60%
   thinningRateThreshold: number; // e.g., 15 for >15% per year
 }
+
+export type VisualListMode = 'suggested' | 'final' | 'diff';
+
+export interface VisualHighlightRequest {
+  ids: string[];
+  sourceYear: number;
+  baseYear?: number | null;
+  mode?: VisualListMode;
+  enableDisposalColors?: boolean;
+  suggestedIds?: string[];
+  finalIds?: string[];
+  origin?: 'decision' | 'import' | 'trend';
+}
+
+export interface DecisionLaunchRequest {
+  targetYear: number;
+  tab: 'disposal' | 'warning' | 'compare' | 'finalDiff';
+  nonce: number;
+}

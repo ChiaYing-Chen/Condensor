@@ -6,6 +6,7 @@ import TrendAnalysis from './components/TrendAnalysis';
 import DecisionSystem from './components/DecisionSystem';
 import DataImport from './components/DataImport';
 import DutyCalculator from './components/DutyCalculator';
+import { VisualHighlightRequest, DecisionLaunchRequest } from './types';
 
 type Tab = 'dashboard' | 'canvas' | 'trend' | 'decision' | 'calculator' | 'import';
 
@@ -16,8 +17,25 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [dbOffline, setDbOffline] = useState(false);
   const [highlightTubes, setHighlightTubes] = useState<Set<string> | null>(null);
+  const [highlightConfig, setHighlightConfig] = useState<VisualHighlightRequest | null>(null);
   const [filterSourceYear, setFilterSourceYear] = useState<number | null>(null);
   const [filterBaseYear, setFilterBaseYear] = useState<number | null>(null);
+  const [decisionLaunch, setDecisionLaunch] = useState<DecisionLaunchRequest | null>(null);
+
+  const applyHighlightRequest = (req: VisualHighlightRequest) => {
+    setHighlightTubes(new Set(req.ids));
+    setHighlightConfig(req);
+    setFilterSourceYear(req.sourceYear);
+    setFilterBaseYear(req.baseYear ?? null);
+    setActiveTab('canvas');
+  };
+
+  const clearVisualHighlight = () => {
+    setHighlightTubes(null);
+    setHighlightConfig(null);
+    setFilterSourceYear(null);
+    setFilterBaseYear(null);
+  };
 
   useEffect(() => {
     fetch(`${import.meta.env.BASE_URL}api/units`)
@@ -57,12 +75,12 @@ export default function App() {
   const renderContent = () => {
     switch (activeTab) {
       case 'dashboard': return <Dashboard unitData={currentUnit} />;
-      case 'canvas': return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
-      case 'trend': return <TrendAnalysis unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
-      case 'decision': return <DecisionSystem unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => { setHighlightTubes(new Set(ids)); setFilterSourceYear(sourceYear); setFilterBaseYear(baseYear); setActiveTab('canvas'); }} />;
+      case 'canvas': return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} highlightConfig={highlightConfig} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={clearVisualHighlight} />;
+      case 'trend': return <TrendAnalysis unitData={currentUnit} onApplyToVisual={(ids: string[], sourceYear: number, baseYear: number) => applyHighlightRequest({ ids, sourceYear, baseYear, mode: 'suggested', origin: 'trend' })} />;
+      case 'decision': return <DecisionSystem unitData={currentUnit} onApplyToVisual={applyHighlightRequest} launchRequest={decisionLaunch} />;
       case 'calculator': return <DutyCalculator unitId={selectedUnitId} />;
-      case 'import': return <DataImport unitId={selectedUnitId} />;
-      default: return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={() => { setHighlightTubes(null); setFilterSourceYear(null); setFilterBaseYear(null); }} />;
+      case 'import': return <DataImport unitId={selectedUnitId} onApplyToVisual={applyHighlightRequest} onCompareWithDecision={(targetYear: number) => { setDecisionLaunch({ targetYear, tab: 'finalDiff', nonce: Date.now() }); setActiveTab('decision'); }} />;
+      default: return <TubeSheetCanvas unitId={selectedUnitId} highlightTubes={highlightTubes} highlightConfig={highlightConfig} filterSourceYear={filterSourceYear} filterBaseYear={filterBaseYear} onClearHighlight={clearVisualHighlight} />;
     }
   };
 
@@ -98,7 +116,11 @@ export default function App() {
             </div>
             <select
               value={selectedUnitId}
-              onChange={(e) => setSelectedUnitId(e.target.value)}
+              onChange={(e) => {
+                setSelectedUnitId(e.target.value);
+                clearVisualHighlight();
+                setDecisionLaunch(null);
+              }}
               className="w-full bg-slate-950 border border-slate-700 text-white rounded-lg px-3 py-2.5 text-sm text-center [text-align-last:center] focus:ring-blue-500 focus:border-blue-500 shadow-inner outline-none cursor-pointer font-bold"
             >
               {units.length > 0
@@ -155,4 +177,3 @@ function NavItem({ icon, label, active, onClick }: { icon: React.ReactNode, labe
     </button>
   );
 }
-

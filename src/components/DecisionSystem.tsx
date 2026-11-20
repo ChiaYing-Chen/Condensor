@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings2, ShieldAlert, Wrench, AlertTriangle, Database, Plus, Trash2, Loader2, Play, Download, Save, Bookmark, GitCompare } from 'lucide-react';
+import { Settings2, ShieldAlert, Wrench, AlertTriangle, Database, Plus, Trash2, Loader2, Play, Download, Save, Bookmark, GitCompare, CheckCircle2, FileSpreadsheet } from 'lucide-react';
 import * as XLSX from 'xlsx';
+import { VisualHighlightRequest, DecisionLaunchRequest } from '../types';
+import { normalizeMaintAction, formatMaintActionLabel } from '../utils/maintenanceAction';
 
 interface DecisionSystemProps {
   unitData: any;
-  onApplyToVisual?: (ids: string[], sourceYear: number, baseYear: number) => void;
+  onApplyToVisual?: (request: VisualHighlightRequest) => void;
+  launchRequest?: DecisionLaunchRequest | null;
 }
 
 interface Rule {
@@ -101,7 +104,7 @@ const formatReasonForExcel = (reason: string): string => {
   return formatted;
 };
 
-export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSystemProps) {
+export default function DecisionSystem({ unitData, onApplyToVisual, launchRequest }: DecisionSystemProps) {
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
   
@@ -122,8 +125,33 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
   const [pastCurrentSelection, setPastCurrentSelection] = useState<string>('');
   const [pastPreviousSelection, setPastPreviousSelection] = useState<string>('');
   const [hasGeneratedCompare, setHasGeneratedCompare] = useState(false);
-  const [activeResultTab, setActiveResultTab] = useState<'disposal' | 'warning' | 'compare'>('disposal');
+  const [hasGeneratedFinalDiff, setHasGeneratedFinalDiff] = useState(false);
+  const [activeResultTab, setActiveResultTab] = useState<'disposal' | 'warning' | 'compare' | 'finalDiff'>('disposal');
   const [activeCompareCategory, setActiveCompareCategory] = useState<'hit' | 'unexpected' | 'watch'>('hit');
+  const [activeFinalDiffCategory, setActiveFinalDiffCategory] = useState<'matched' | 'added' | 'kept'>('matched');
+  const [finalDiffData, setFinalDiffData] = useState<{
+    targetYear: number;
+    suggestedCount: number;
+    finalCount: number;
+    rplCount: number;
+    plgCount: number;
+    matchedList: any[];
+    addedList: any[];
+    keptList: any[];
+    suggestedIds: string[];
+    finalIds: string[];
+  }>({
+    targetYear: 0,
+    suggestedCount: 0,
+    finalCount: 0,
+    rplCount: 0,
+    plgCount: 0,
+    matchedList: [],
+    addedList: [],
+    keptList: [],
+    suggestedIds: [],
+    finalIds: [],
+  });
   const [compareData, setCompareData] = useState<{
     pastWarningCount: number;
     currDisposalCount: number;
@@ -144,9 +172,16 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
 
   const warningInputRef = useRef<HTMLInputElement>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const pendingLaunchRef = useRef<DecisionLaunchRequest | null>(null);
 
   // 原始快取資料
   const [tubesData, setTubesData] = useState<any[]>([]);
+
+  useEffect(() => {
+    if (launchRequest) {
+      pendingLaunchRef.current = launchRequest;
+    }
+  }, [launchRequest]);
 
   useEffect(() => {
     // 載入資料庫的公式情境
@@ -217,6 +252,28 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
       : `${olderYear}-before`;
     setPastPreviousSelection(defaultPastPrev);
   }, [previousSelection, availableYears, maintenanceYears]);
+
+  // 當切換比對年份時，重設跨期最終處置比對狀態
+  useEffect(() => {
+    setHasGeneratedFinalDiff(false);
+  }, [currentSelection, previousSelection, unitData]);
+
+  // 處理外部（如資料匯入頁）傳入的一鍵比對跳轉請求
+  useEffect(() => {
+    if (loading || !pendingLaunchRef.current || availableYears.length === 0) return;
+    const req = pendingLaunchRef.current;
+    pendingLaunchRef.current = null;
+
+    const targetYear = availableYears.includes(req.targetYear) ? req.targetYear : availableYears[0];
+    const nextCurrSel = `${targetYear}-before`;
+    const prevY = availableYears.find(y => y < targetYear) ?? targetYear;
+    const nextPrevSel = maintenanceYears.includes(prevY) ? `${prevY}-after` : `${prevY}-before`;
+
+    setCurrentSelection(nextCurrSel);
+    setPreviousSelection(nextPrevSel);
+    runAnalysis(req.tab, nextCurrSel, nextPrevSel);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, availableYears, maintenanceYears, tubesData, launchRequest]);
 
   const fetchStateData = async (selection: string, unitId: string) => {
     if (!selection) return new Map();
@@ -401,8 +458,14 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     return { suggestions, warnings, suggestionMap, warningMap };
   };
 
-  const runAnalysis = async (targetMode: 'disposal' | 'warning' | 'compare' = 'disposal') => {
-    if (!currentSelection || !previousSelection) return;
+  const runAnalysis = async (
+    targetMode: 'disposal' | 'warning' | 'compare' | 'finalDiff' = 'disposal',
+    overrideCurrSel?: string,
+    overridePrevSel?: string
+  ) => {
+    const effectiveCurrSel = overrideCurrSel || currentSelection;
+    const effectivePrevSel = overridePrevSel || previousSelection;
+    if (!effectiveCurrSel || !effectivePrevSel) return;
 
     const trimmedWarning = warningFormula.trim();
     if (targetMode === 'warning' || targetMode === 'compare') {
@@ -422,23 +485,39 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     setAnalyzing(true);
 
     try {
+      const [currYearStr, currMode] = effectiveCurrSel.split('-');
+      const latestYear = Number(currYearStr);
+      const targetHasMaint = latestYear > 0 && maintenanceYears.includes(latestYear);
+
       const shouldRunCompare =
         (targetMode === 'compare' || hasGeneratedCompare) &&
         Boolean(pastCurrentSelection) &&
         Boolean(pastPreviousSelection) &&
         isFormulaSyntaxValid(trimmedWarning);
 
-      const [[currMap, prevMap], pastMaps] = await Promise.all([
+      const shouldRunFinalDiff =
+        targetHasMaint &&
+        (targetMode === 'finalDiff' || targetMode === 'disposal' || hasGeneratedFinalDiff);
+
+      const [[currMap, prevMap], pastMaps, finalDiffInputs] = await Promise.all([
         Promise.all([
-          fetchStateData(currentSelection, unitData.unit_id),
-          fetchStateData(previousSelection, unitData.unit_id)
+          fetchStateData(effectiveCurrSel, unitData.unit_id),
+          fetchStateData(effectivePrevSel, unitData.unit_id)
         ]),
         shouldRunCompare
           ? Promise.all([
               fetchStateData(pastCurrentSelection, unitData.unit_id),
               fetchStateData(pastPreviousSelection, unitData.unit_id)
             ])
-          : Promise.resolve<[Map<string, any>, Map<string, any>] | null>(null)
+          : Promise.resolve<[Map<string, any>, Map<string, any>] | null>(null),
+        shouldRunFinalDiff
+          ? Promise.all([
+              fetch(`${import.meta.env.BASE_URL}api/maintenance?unit_id=${unitData.unit_id}&year=${latestYear}`).then(r => r.json()),
+              currMode === 'after'
+                ? fetchStateData(`${latestYear}-before`, unitData.unit_id)
+                : Promise.resolve<Map<string, any> | null>(null)
+            ])
+          : Promise.resolve<[any[], Map<string, any> | null] | null>(null)
       ]);
 
       const activeRules = rules.filter(r => r.enabled && r.formula.trim().length > 0);
@@ -447,8 +526,6 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
         isFormulaSyntaxValid(trimmedWarning);
 
       const commissionYear = unitData.commission_year || 2018;
-      const [currYearStr] = currentSelection.split('-');
-      const latestYear = Number(currYearStr);
 
       const tubeMap = new Map();
       if (Array.isArray(tubesData)) {
@@ -474,6 +551,107 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
       }
       if (targetMode === 'warning') {
         setHasGeneratedWarning(true);
+      }
+
+      if (shouldRunFinalDiff && finalDiffInputs) {
+        const [maintRows, beforeMapOverride] = finalDiffInputs;
+        const preMaintMap = beforeMapOverride || currMap;
+        const evalWarnForFinal = isFormulaSyntaxValid(trimmedWarning);
+        const sugCycle = beforeMapOverride
+          ? evaluateCycle(preMaintMap, prevMap, latestYear, activeRules, trimmedWarning, evalWarnForFinal, tubeMap, commissionYear)
+          : (evalWarnForFinal && !shouldEvaluateWarning
+              ? evaluateCycle(preMaintMap, prevMap, latestYear, activeRules, trimmedWarning, true, tubeMap, commissionYear)
+              : currCycle);
+
+        const maintById = new Map<string, any>();
+        const actualDisposals = new Map<string, any>();
+        let rplCount = 0;
+        let plgCount = 0;
+
+        if (Array.isArray(maintRows)) {
+          maintRows.forEach((m: any) => {
+            const z = String(m.zone || '').trim().toUpperCase();
+            const id = `${z}-${m.row_num}-${m.col_num}`;
+            const normAction = normalizeMaintAction(m.action);
+            const enriched = { ...m, zone: z, normAction };
+            maintById.set(id, enriched);
+            if (normAction === 'RPL' || normAction === 'PLG') {
+              actualDisposals.set(id, enriched);
+              if (normAction === 'RPL') rplCount++;
+              else plgCount++;
+            }
+          });
+        }
+
+        const matchedList: any[] = [];
+        const addedList: any[] = [];
+        const keptList: any[] = [];
+
+        sugCycle.suggestions.forEach(sug => {
+          const disp = actualDisposals.get(sug.id);
+          if (disp) {
+            matchedList.push({
+              ...sug,
+              action: disp.normAction,
+              new_material: disp.new_material || '',
+              maintNotes: disp.notes || '',
+            });
+          } else {
+            const anyMaint = maintById.get(sug.id);
+            keptList.push({
+              ...sug,
+              action: 'KEP',
+              new_material: '',
+              maintNotes: anyMaint?.notes || '',
+            });
+          }
+        });
+
+        actualDisposals.forEach((disp, id) => {
+          if (sugCycle.suggestionMap.has(id)) return;
+          const rawCurr = preMaintMap.get(id);
+          const rawPrev = prevMap.get(id);
+          const tubeMeta = tubeMap.get(id);
+          const this_depth = rawCurr ? rawCurr.depth : 0;
+          const prev_depth = rawPrev ? rawPrev.depth : 0;
+          const depth_Diff = this_depth > prev_depth ? (this_depth - prev_depth) : 0;
+          const installYear = tubeMeta?.install_year || commissionYear;
+          const TubeAge = latestYear > 0 ? (latestYear - installYear) : 0;
+          const isWarn = sugCycle.warningMap.has(id);
+
+          addedList.push({
+            id,
+            quadrant: disp.zone,
+            TubeAge,
+            this_depth,
+            depth_Diff,
+            Code: rawCurr?.code || 'NDD',
+            reasons: isWarn ? [`未達處置門檻（符合警示: ${trimmedWarning}）`] : ['未達建議公式門檻'],
+            action: disp.normAction,
+            new_material: disp.new_material || '',
+            maintNotes: disp.notes || '',
+          });
+        });
+
+        matchedList.sort((a, b) => b.this_depth - a.this_depth);
+        addedList.sort((a, b) => b.this_depth - a.this_depth);
+        keptList.sort((a, b) => b.this_depth - a.this_depth);
+
+        setFinalDiffData({
+          targetYear: latestYear,
+          suggestedCount: sugCycle.suggestions.length,
+          finalCount: actualDisposals.size,
+          rplCount,
+          plgCount,
+          matchedList,
+          addedList,
+          keptList,
+          suggestedIds: sugCycle.suggestions.map(s => s.id),
+          finalIds: Array.from(actualDisposals.keys()),
+        });
+        setHasGeneratedFinalDiff(true);
+      } else if (targetMode === 'finalDiff') {
+        setHasGeneratedFinalDiff(false);
       }
 
       if (shouldRunCompare && pastMaps) {
@@ -619,6 +797,88 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, sheetName);
     XLSX.writeFile(wb, fileName);
+  };
+
+  const exportDisposalTemplate = (list: any[]) => {
+    if (list.length === 0) return;
+    const [yearStr] = currentSelection.split('-');
+    const targetYear = Number(yearStr) || new Date().getFullYear();
+    const rows = list.map(item => {
+      const parts = item.id.split('-');
+      return {
+        '機組/Unit': unitData.unit_id,
+        '年份': targetYear,
+        '區域/Zone': parts[0] || '',
+        '行/Row': Number(parts[1]) || parts[1] || '',
+        '列/Col': Number(parts[2]) || parts[2] || '',
+        '處置/action': '',
+        '新材質/new_material': '',
+        '備註/notes': '',
+        '本次深度(%)': parseFloat(item.this_depth.toFixed(1)),
+        '建議觸發條件': item.reasons.map(formatReasonForExcel).join(' | '),
+      };
+    });
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws['!cols'] = [
+      { wch: 10 },
+      { wch: 8 },
+      { wch: 10 },
+      { wch: 8 },
+      { wch: 8 },
+      { wch: 14 },
+      { wch: 16 },
+      { wch: 24 },
+      { wch: 12 },
+      { wch: 52 },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, '大修處置底稿');
+    XLSX.writeFile(wb, `${unitData.unit_id}_${targetYear}_大修處置底稿.xlsx`);
+  };
+
+  const exportFinalDiffToExcel = () => {
+    if (!hasGeneratedFinalDiff) return;
+    const wb = XLSX.utils.book_new();
+    const buildSheet = (list: any[], sheetName: string) => {
+      const rows = list.map(item => {
+        const parts = item.id.split('-');
+        return {
+          '區域': parts[0] || '',
+          '行/Row': Number(parts[1]) || parts[1] || '',
+          '列/Col': Number(parts[2]) || parts[2] || '',
+          '管齡(年)': item.TubeAge,
+          '本次深度(%)': parseFloat(item.this_depth.toFixed(1)),
+          '深度差異(%)': parseFloat(item.depth_Diff.toFixed(1)),
+          '建議觸發條件': item.reasons.map(formatReasonForExcel).join(' | '),
+          '最終處置(After)': formatMaintActionLabel(item.action),
+          '新材質': item.new_material || '',
+          '處置備註': item.maintNotes || '',
+        };
+      });
+      const ws = XLSX.utils.json_to_sheet(
+        rows.length > 0
+          ? rows
+          : [{ '區域': '無符合資料', '行/Row': '', '列/Col': '', '管齡(年)': '', '本次深度(%)': '', '深度差異(%)': '', '建議觸發條件': '', '最終處置(After)': '', '新材質': '', '處置備註': '' }]
+      );
+      ws['!cols'] = [
+        { wch: 8 },
+        { wch: 8 },
+        { wch: 8 },
+        { wch: 10 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 48 },
+        { wch: 16 },
+        { wch: 14 },
+        { wch: 28 },
+      ];
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    };
+
+    buildSheet(finalDiffData.matchedList, '1_依建議執行');
+    buildSheet(finalDiffData.addedList, '2_決策額外新增');
+    buildSheet(finalDiffData.keptList, '3_建議但最終保留');
+    XLSX.writeFile(wb, `${unitData.unit_id}_${finalDiffData.targetYear}_最終處置與建議比對.xlsx`);
   };
 
   const exportCompareToExcel = () => {
@@ -928,7 +1188,7 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
             aria-label="篩選結果清單"
             className="flex overflow-x-auto border-b border-slate-800 mb-5 gap-2"
             onKeyDown={(e) => {
-              const tabOrder: Array<'disposal' | 'warning' | 'compare'> = ['disposal', 'warning', 'compare'];
+              const tabOrder: Array<'disposal' | 'warning' | 'compare' | 'finalDiff'> = ['disposal', 'warning', 'compare', 'finalDiff'];
               const currentIdx = tabOrder.indexOf(activeResultTab);
               let nextIdx = currentIdx;
               if (e.key === 'ArrowRight') nextIdx = (currentIdx + 1) % tabOrder.length;
@@ -1001,6 +1261,33 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                 {hasGeneratedCompare ? `${compareData.hitList.length}/${compareData.currDisposalCount}` : '比對'}
               </span>
             </button>
+            <button
+              ref={(el) => { tabRefs.current[3] = el; }}
+              type="button"
+              role="tab"
+              id="tab-finalDiff"
+              aria-selected={activeResultTab === 'finalDiff'}
+              tabIndex={activeResultTab === 'finalDiff' ? 0 : -1}
+              onClick={() => {
+                setActiveResultTab('finalDiff');
+                const [yStr] = currentSelection.split('-');
+                const targetY = Number(yStr);
+                if (targetY && maintenanceYears.includes(targetY) && !hasGeneratedFinalDiff && !analyzing) {
+                  runAnalysis('finalDiff');
+                }
+              }}
+              className={`relative flex-none pb-3 px-4 text-sm font-semibold flex items-center gap-2 transition-colors whitespace-nowrap focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-400 ${
+                activeResultTab === 'finalDiff'
+                  ? "text-white after:content-[''] after:absolute after:inset-x-0 after:bottom-0 after:border-b-2 after:border-emerald-400"
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <CheckCircle2 size={16} className="text-emerald-400" aria-hidden="true" />
+              <span>最終處置比對</span>
+              <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-300">
+                {hasGeneratedFinalDiff ? `${finalDiffData.finalCount}/${finalDiffData.suggestedCount}` : 'After'}
+              </span>
+            </button>
           </div>
 
           {[
@@ -1055,13 +1342,36 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                       onClick={() => {
                         const [sourceYearStr] = currentSelection.split('-');
                         const [baseYearStr] = previousSelection.split('-');
-                        onApplyToVisual(panel.items.map(item => item.id), Number(sourceYearStr), Number(baseYearStr));
+                        const sourceYear = Number(sourceYearStr);
+                        const ids = panel.items.map(item => item.id);
+                        onApplyToVisual({
+                          ids,
+                          suggestedIds: panel.key === 'disposal' ? ids : undefined,
+                          finalIds: panel.key === 'disposal' && hasGeneratedFinalDiff && finalDiffData.targetYear === sourceYear
+                            ? finalDiffData.finalIds
+                            : undefined,
+                          sourceYear,
+                          baseYear: Number(baseYearStr),
+                          mode: 'suggested',
+                          origin: 'decision',
+                        });
                       }}
                       disabled={panel.items.length === 0}
                       className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
                       title="將結果套用至動態視覺檢視的畫布上"
                     >
                       <Play size={14} /> 在視覺圖中檢視
+                    </button>
+                  )}
+                  {panel.key === 'disposal' && (
+                    <button
+                      type="button"
+                      onClick={() => exportDisposalTemplate(panel.items)}
+                      disabled={panel.items.length === 0}
+                      className="text-xs bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
+                      title="匯出含處置/action與新材質欄位的 Excel 底稿，編輯後可直接上傳至大修處置 (After)"
+                    >
+                      <FileSpreadsheet size={14} /> 匯出處置底稿
                     </button>
                   )}
                   <button
@@ -1308,11 +1618,13 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                           onClick={() => {
                             const [sourceYearStr] = currentSelection.split('-');
                             const [pastYearStr] = pastCurrentSelection.split('-');
-                            onApplyToVisual(
-                              activeCategoryItems.map(item => item.id),
-                              Number(sourceYearStr),
-                              Number(pastYearStr)
-                            );
+                            onApplyToVisual({
+                              ids: activeCategoryItems.map(item => item.id),
+                              sourceYear: Number(sourceYearStr),
+                              baseYear: Number(pastYearStr),
+                              mode: 'suggested',
+                              origin: 'decision',
+                            });
                           }}
                           disabled={activeCategoryItems.length === 0}
                           className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-2 transition-colors"
@@ -1401,6 +1713,285 @@ export default function DecisionSystem({ unitData, onApplyToVisual }: DecisionSy
                               {hasGeneratedCompare
                                 ? '此分類目前無符合管束。'
                                 : '尚未執行預警追蹤比對，請點擊左側或上方「預警追蹤比對 / 重新比對」按鈕。'}
+                            </td>
+                          </tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+
+          <div
+            role="tabpanel"
+            aria-labelledby="tab-finalDiff"
+            hidden={activeResultTab !== 'finalDiff'}
+          >
+            {(() => {
+              const [currYearStr] = currentSelection.split('-');
+              const currYearNum = Number(currYearStr) || 0;
+              const targetHasMaint = currYearNum > 0 && maintenanceYears.includes(currYearNum);
+
+              if (!targetHasMaint) {
+                return (
+                  <div className="py-12 px-6 text-center bg-slate-950/50 border border-slate-800 border-dashed rounded-xl space-y-2">
+                    <CheckCircle2 size={32} className="mx-auto text-slate-600" aria-hidden="true" />
+                    <h3 className="text-base font-semibold text-slate-200">
+                      {currYearNum} 年度尚未上傳「大修處置 (After)」資料
+                    </h3>
+                    <p className="text-xs text-slate-400 max-w-md mx-auto">
+                      請先從上方「建議處置清單」匯出處置底稿 Excel，定案並由左側「資料匯入與匯出 → 上傳【大修處置】(After)」匯入後，系統即可自動比對差異並顯示於視覺圖。
+                    </p>
+                  </div>
+                );
+              }
+
+              const cards = [
+                {
+                  key: 'matched' as const,
+                  title: '① 依建議執行',
+                  subtitle: '建議命中並實際換/塞管',
+                  count: finalDiffData.matchedList.length,
+                  detail: '公式建議與最終決策一致',
+                  activeClass: 'border-emerald-500 bg-emerald-950/30',
+                  countClass: 'text-emerald-400',
+                },
+                {
+                  key: 'added' as const,
+                  title: '② 決策額外新增',
+                  subtitle: '未達建議門檻，現場追加',
+                  count: finalDiffData.addedList.length,
+                  detail: '視覺圖將以金色外框凸顯',
+                  activeClass: 'border-amber-500 bg-amber-950/30',
+                  countClass: 'text-amber-400',
+                },
+                {
+                  key: 'kept' as const,
+                  title: '③ 建議但最終保留',
+                  subtitle: '公式建議處置但評估暫緩',
+                  count: finalDiffData.keptList.length,
+                  detail: '視覺圖將以虛線空心圈標示',
+                  activeClass: 'border-slate-500 bg-slate-800/40',
+                  countClass: 'text-slate-300',
+                },
+              ];
+
+              const activeMeta = cards.find(c => c.key === activeFinalDiffCategory) || cards[0];
+              const activeItems =
+                activeFinalDiffCategory === 'matched'
+                  ? finalDiffData.matchedList
+                  : activeFinalDiffCategory === 'added'
+                    ? finalDiffData.addedList
+                    : finalDiffData.keptList;
+
+              const [baseYearStr] = previousSelection.split('-');
+              const baseYearNum = Number(baseYearStr) || null;
+              const diffUnionIds = Array.from(new Set([...finalDiffData.suggestedIds, ...finalDiffData.finalIds]));
+
+              return (
+                <>
+                  <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-950/60 border border-slate-800 rounded-lg p-3 mb-4">
+                    <div className="text-xs text-slate-300">
+                      比對基準：<span className="font-bold text-white">{currYearNum} 年大修檢測建議</span>
+                      <span className="mx-2 text-slate-500">VS</span>
+                      <span className="font-bold text-emerald-400">{currYearNum} 年大修處置 (After)</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => runAnalysis('finalDiff')}
+                      disabled={analyzing}
+                      className="text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors"
+                    >
+                      {analyzing ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
+                      重新比對最終處置
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                    <div className="flex items-center justify-between bg-red-950/20 border border-red-500/30 rounded-lg px-4 py-2.5">
+                      <div>
+                        <div className="text-xs font-semibold text-red-300">建議處置總數</div>
+                        <div className="text-[11px] text-slate-400">
+                          ① 依建議執行 ({finalDiffData.matchedList.length}) + ③ 建議但保留 ({finalDiffData.keptList.length})
+                        </div>
+                      </div>
+                      <div className="text-xl font-bold tabular-nums text-red-400">
+                        {finalDiffData.suggestedCount} <span className="text-xs font-normal text-slate-400">支</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between bg-emerald-950/20 border border-emerald-500/30 rounded-lg px-4 py-2.5">
+                      <div>
+                        <div className="text-xs font-semibold text-emerald-300">最終大修處置總數 (After)</div>
+                        <div className="text-[11px] text-slate-400">
+                          換管 RPL {finalDiffData.rplCount} 支 · 塞管 PLG {finalDiffData.plgCount} 支
+                        </div>
+                      </div>
+                      <div className="text-xl font-bold tabular-nums text-emerald-400">
+                        {finalDiffData.finalCount} <span className="text-xs font-normal text-slate-400">支</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+                    {cards.map((card) => (
+                      <button
+                        key={card.key}
+                        type="button"
+                        aria-pressed={activeFinalDiffCategory === card.key}
+                        onClick={() => setActiveFinalDiffCategory(card.key)}
+                        className={`text-left p-3.5 rounded-xl border transition-all focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-400 ${
+                          activeFinalDiffCategory === card.key
+                            ? card.activeClass
+                            : 'border-slate-800 bg-slate-950/40 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-bold text-white">{card.title}</span>
+                          <span className={`text-xl font-bold tabular-nums ${card.countClass}`}>
+                            {card.key === 'added' && card.count > 0 ? `+${card.count}` : card.count}{' '}
+                            <span className="text-xs font-normal text-slate-400">支</span>
+                          </span>
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1">{card.subtitle}</div>
+                        <div className="text-[11px] text-slate-300 mt-2 pt-2 border-t border-slate-800/80">
+                          {card.detail}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                    <div className="flex items-center gap-2">
+                      <CheckCircle2 className="text-emerald-400" size={18} aria-hidden="true" />
+                      <h3 className="text-base font-semibold text-slate-100">
+                        {activeMeta.title}（{activeMeta.subtitle}）
+                      </h3>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {onApplyToVisual && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onApplyToVisual({
+                                ids: finalDiffData.finalIds,
+                                suggestedIds: finalDiffData.suggestedIds,
+                                finalIds: finalDiffData.finalIds,
+                                sourceYear: currYearNum,
+                                baseYear: baseYearNum,
+                                mode: 'final',
+                                enableDisposalColors: true,
+                                origin: 'decision',
+                              })
+                            }
+                            disabled={finalDiffData.finalIds.length === 0}
+                            className="text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors font-semibold"
+                            title="僅顯示最終大修處置 (After) 的管束並開啟處置顏色"
+                          >
+                            <Play size={14} /> 視覺圖檢視最終處置 ({finalDiffData.finalIds.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onApplyToVisual({
+                                ids: diffUnionIds,
+                                suggestedIds: finalDiffData.suggestedIds,
+                                finalIds: finalDiffData.finalIds,
+                                sourceYear: currYearNum,
+                                baseYear: baseYearNum,
+                                mode: 'diff',
+                                enableDisposalColors: true,
+                                origin: 'decision',
+                              })
+                            }
+                            disabled={diffUnionIds.length === 0}
+                            className="text-xs bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors font-semibold"
+                            title="同時標示依建議執行、決策新增與建議保留的差異"
+                          >
+                            <GitCompare size={14} /> 視覺圖檢視差異
+                          </button>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        onClick={exportFinalDiffToExcel}
+                        disabled={!hasGeneratedFinalDiff}
+                        className="text-xs bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors"
+                      >
+                        <Download size={14} /> 差異比對下載
+                      </button>
+                      <div className="text-sm font-medium px-3 py-1 rounded-full bg-emerald-900/20 text-emerald-300">
+                        共 {activeItems.length} 支
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    tabIndex={0}
+                    role="region"
+                    aria-label={`${activeMeta.title}明細`}
+                    className="overflow-x-auto max-h-[440px] overflow-y-auto custom-scrollbar focus-visible:outline focus-visible:outline-2 focus-visible:outline-emerald-400"
+                  >
+                    <table className="w-full text-left border-collapse">
+                      <thead className="sticky top-0 bg-slate-900 shadow-sm z-10">
+                        <tr className="bg-slate-800/50 border-y border-slate-800">
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">區域</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">行/Row</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">列/Col</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">管齡</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">本次深度</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">深度差異</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">建議觸發條件</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400 whitespace-nowrap">最終處置 (After)</th>
+                          <th scope="col" className="py-3 px-4 text-sm font-semibold text-slate-400">材質 / 備註</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800">
+                        {activeItems.map((item) => {
+                          const parts = item.id.split('-');
+                          const actionBadgeClass =
+                            item.action === 'RPL'
+                              ? 'bg-red-950/70 text-red-300 border-red-800'
+                              : item.action === 'PLG'
+                                ? 'bg-fuchsia-950/70 text-fuchsia-300 border-fuchsia-800'
+                                : 'bg-slate-800 text-slate-300 border-slate-700';
+                          return (
+                            <tr key={item.id} className="hover:bg-slate-800/50">
+                              <td className="py-3 px-4 text-sm font-bold text-blue-300">{parts[0]}</td>
+                              <td className="py-3 px-4 text-sm font-medium text-white">{parts[1]}</td>
+                              <td className="py-3 px-4 text-sm font-medium text-white">{parts[2]}</td>
+                              <td className="py-3 px-4 text-sm text-slate-300">{item.TubeAge} 年</td>
+                              <td className={`py-3 px-4 text-sm font-bold ${activeMeta.countClass}`}>
+                                {item.this_depth.toFixed(1)}%
+                              </td>
+                              <td className="py-3 px-4 text-sm font-bold text-amber-500">
+                                +{item.depth_Diff.toFixed(1)}%
+                              </td>
+                              <td className="py-3 px-4 text-xs text-slate-400 max-w-[200px]">
+                                <ul className="list-disc pl-4 space-y-0.5">
+                                  {item.reasons.map((r: string, i: number) => <li key={i}>{r}</li>)}
+                                </ul>
+                              </td>
+                              <td className="py-3 px-4 text-xs whitespace-nowrap">
+                                <span className={`px-2 py-0.5 rounded border font-semibold ${actionBadgeClass}`}>
+                                  {formatMaintActionLabel(item.action)}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4 text-xs text-slate-300 max-w-[200px]">
+                                {item.new_material && <div className="text-yellow-200 font-medium">新材質: {item.new_material}</div>}
+                                <div className="text-slate-400">{item.maintNotes || (item.new_material ? '' : '-')}</div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                        {activeItems.length === 0 && (
+                          <tr>
+                            <td colSpan={9} className="py-8 text-center text-slate-500">
+                              {hasGeneratedFinalDiff
+                                ? '此分類目前無符合管束。'
+                                : '點擊上方「重新比對最終處置」或左側「執行篩選」產生比對結果。'}
                             </td>
                           </tr>
                         )}

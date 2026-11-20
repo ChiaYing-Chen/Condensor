@@ -1,25 +1,30 @@
 import React, { useState, useEffect } from 'react';
 import { 
-  Upload, FileType, CheckCircle2, AlertCircle, KeyRound, Loader2, X, Info, Download, 
-  History, Eye, RefreshCw, Search, Clock, FileSpreadsheet, ShieldAlert, FileText 
+  Upload, FileType, CheckCircle2, AlertCircle, ShieldCheck, Loader2, X, Info, Download, 
+  History, Eye, RefreshCw, Search, Clock, FileSpreadsheet, ShieldAlert, FileText, PlayCircle, GitCompare 
 } from 'lucide-react';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
 import { generateTubeMap } from '../utils/tubeMapGenerator';
+import { VisualHighlightRequest } from '../types';
+import { normalizeMaintAction } from '../utils/maintenanceAction';
+import { fetchCurrentUserPermission, CurrentUserPermissionInfo } from '../utils/userPermission';
 
 interface DataImportProps {
   unitId: string;
+  onApplyToVisual?: (request: VisualHighlightRequest) => void;
+  onCompareWithDecision?: (targetYear: number) => void;
 }
 
-export default function DataImport({ unitId }: DataImportProps) {
+export default function DataImport({ unitId, onApplyToVisual, onCompareWithDecision }: DataImportProps) {
   const [importMode, setImportMode] = useState<'before' | 'after'>('before');
   const [dragActive, setDragActive] = useState(false);
-  const [status, setStatus] = useState<'idle' | 'parsing' | 'validation_review' | 'uploading' | 'success' | 'error' | 'password_required'>('idle');
+  const [status, setStatus] = useState<'idle' | 'parsing' | 'validation_review' | 'uploading' | 'success' | 'error' | 'overwrite_confirm'>('idle');
   const [message, setMessage] = useState('');
   const [warningMessage, setWarningMessage] = useState(''); // 非阻斷的警告訊息
   const [duplicateList, setDuplicateList] = useState<any[]>([]);
   const [missingList, setMissingList] = useState<any[]>([]);
-  const [password, setPassword] = useState('');
+  const [currentUserInfo, setCurrentUserInfo] = useState<CurrentUserPermissionInfo>({ userId: '', userName: '訪客', isAdmin: false });
   const [existingNotesCount, setExistingNotesCount] = useState<number>(0);
   const [notesMode, setNotesMode] = useState<'merge' | 'overwrite'>('merge');
   const [pendingRecords, setPendingRecords] = useState<any[]>([]);
@@ -34,6 +39,53 @@ export default function DataImport({ unitId }: DataImportProps) {
   const [selectedHistoryItem, setSelectedHistoryItem] = useState<any | null>(null);
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
   const [detailSearchTerm, setDetailSearchTerm] = useState('');
+  const [lastUploadedMaint, setLastUploadedMaint] = useState<{
+    unitId: string;
+    year: number;
+    ids: string[];
+    rplCount: number;
+    plgCount: number;
+  } | null>(null);
+
+  const summarizeMaintRecords = (rows: any[], targetYear?: number) => {
+    const years = new Set<number>();
+    rows.forEach(r => {
+      const y = parseInt(String(r['年份'] ?? r.year ?? targetYear ?? ''), 10);
+      if (!isNaN(y)) years.add(y < 1911 && y > 0 ? y + 1911 : y);
+    });
+    const resolvedYear = targetYear ?? (years.size > 0 ? Math.max(...Array.from(years)) : 0);
+    const ids: string[] = [];
+    let rplCount = 0;
+    let plgCount = 0;
+    rows.forEach(r => {
+      const yRaw = parseInt(String(r['年份'] ?? r.year ?? resolvedYear), 10);
+      const y = !isNaN(yRaw) ? (yRaw < 1911 && yRaw > 0 ? yRaw + 1911 : yRaw) : resolvedYear;
+      if (resolvedYear && y !== resolvedYear) return;
+      const act = normalizeMaintAction(r['處置/action'] ?? r.action);
+      if (act !== 'RPL' && act !== 'PLG') return;
+      const zone = String(r['區域/Zone'] ?? r.zone ?? '').trim().toUpperCase();
+      const rowNum = r['行/Row'] ?? r.row_num;
+      const colNum = r['列/Col'] ?? r.col_num;
+      if (zone && rowNum !== undefined && colNum !== undefined) {
+        ids.push(`${zone}-${rowNum}-${colNum}`);
+        if (act === 'RPL') rplCount++;
+        else plgCount++;
+      }
+    });
+    return { unitId, year: resolvedYear, ids, rplCount, plgCount };
+  };
+
+  const launchVisualFromMaint = (year: number, ids: string[]) => {
+    if (!onApplyToVisual || !year) return;
+    onApplyToVisual({
+      ids,
+      finalIds: ids,
+      sourceYear: year,
+      mode: 'final',
+      enableDisposalColors: true,
+      origin: 'import',
+    });
+  };
 
   // 取得歷史上傳紀錄
   const fetchHistory = async () => {
@@ -58,6 +110,23 @@ export default function DataImport({ unitId }: DataImportProps) {
   useEffect(() => {
     fetchHistory();
   }, [unitId, historyFilterType]);
+
+  useEffect(() => {
+    setLastUploadedMaint(null);
+  }, [unitId]);
+
+  useEffect(() => {
+    const refreshPermission = (candidateUser?: string) => {
+      fetchCurrentUserPermission(candidateUser).then(setCurrentUserInfo);
+    };
+    refreshPermission();
+    const handleUserChange = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      refreshPermission(detail?.userId || detail?.username);
+    };
+    window.addEventListener('unified-user-changed', handleUserChange);
+    return () => window.removeEventListener('unified-user-changed', handleUserChange);
+  }, []);
 
   // 檢視歷史上傳明細快照
   const viewHistoryDetail = async (item: any) => {
@@ -149,15 +218,22 @@ export default function DataImport({ unitId }: DataImportProps) {
     }
   };
 
-  const uploadRecords = async (records: any[], pass = '') => {
+  const uploadRecords = async (records: any[], confirmOverwrite = false) => {
     setStatus('uploading');
     setMessage(`正在上傳 ${records.length} 筆紀錄至伺服器...`);
     
     try {
+      const userInfo = currentUserInfo.userId ? currentUserInfo : await fetchCurrentUserPermission();
+      if (userInfo.userId && userInfo.userId !== currentUserInfo.userId) {
+        setCurrentUserInfo(userInfo);
+      }
+      const operatorId = userInfo.userId || (userInfo.userName !== '訪客' ? userInfo.userName : '');
       const endpoint = importMode === 'before' ? `${import.meta.env.BASE_URL}api/records/upload` : `${import.meta.env.BASE_URL}api/maintenance/upload`;
       const bodyPayload = { 
         records, 
-        password: pass, 
+        confirm_overwrite: confirmOverwrite,
+        operator: operatorId,
+        uploaded_by: userInfo.userName !== '訪客' ? userInfo.userName : operatorId,
         unit_id: unitId,
         notes_mode: notesMode,
         fileName: currentFileName || (importMode === 'before' ? `${unitId}_檢測資料.xlsx` : `${unitId}_大修處置.xlsx`)
@@ -172,19 +248,25 @@ export default function DataImport({ unitId }: DataImportProps) {
       const result = await response.json();
       
       if (!response.ok) {
-        if (response.status === 403 && result.requirePassword) {
+        if (response.status === 403 && result.requireConfirm) {
           setExistingNotesCount(result.existingNotesCount || 0);
-          setStatus('password_required');
-          setMessage(result.error || '需要密碼以覆寫現有年份資料');
+          setStatus('overwrite_confirm');
+          setMessage(result.error || '部分年份資料已存在，請再次確認是否覆寫');
           return;
+        }
+        if (response.status === 403 && result.requireAdmin) {
+          const who = result.userName || userInfo.userName || '訪客';
+          throw new Error(`權限不足：僅具 PIMCP Condensor 管理人員權限者可覆寫既有年份資料（目前身分：${who}）`);
         }
         throw new Error(result.error || 'Server error');
       }
       
+      const uploadedMaintSummary = importMode === 'after' ? summarizeMaintRecords(records) : null;
+
       setStatus('success');
       setMessage(`成功匯入！${result.message}`);
+      setLastUploadedMaint(uploadedMaintSummary && uploadedMaintSummary.year > 0 ? uploadedMaintSummary : null);
       setPendingRecords([]);
-      setPassword('');
       setExistingNotesCount(0);
       setPendingYear(null);
       fetchHistory(); // 重新整理歷史紀錄
@@ -433,7 +515,9 @@ export default function DataImport({ unitId }: DataImportProps) {
           const notes = String(row[notesKey] || '');
           
           if (importMode === 'after') {
-            const action = actionKey ? String(row[actionKey] || '').trim().toUpperCase() : '';
+            const rawAction = actionKey ? String(row[actionKey] || '').trim().toUpperCase() : '';
+            const normAct = normalizeMaintAction(rawAction);
+            const action = normAct !== 'OTHER' ? normAct : rawAction;
             const newMaterial = materialKey ? String(row[materialKey] || '').trim() : '';
 
             if (!action) {
@@ -577,7 +661,7 @@ export default function DataImport({ unitId }: DataImportProps) {
     }
 
     setPendingRecords(recordsToUpload);
-    uploadRecords(recordsToUpload, '');
+    uploadRecords(recordsToUpload, false);
   };
 
 
@@ -673,7 +757,7 @@ export default function DataImport({ unitId }: DataImportProps) {
 
       <div className="flex gap-4">
         <button
-          onClick={() => { setImportMode('before'); setStatus('idle'); }}
+          onClick={() => { setImportMode('before'); setStatus('idle'); setLastUploadedMaint(null); }}
           className={`px-5 py-3 rounded-lg border-2 font-medium transition-all ${
             importMode === 'before' 
               ? 'bg-blue-900/40 border-blue-500 text-blue-300 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
@@ -683,7 +767,7 @@ export default function DataImport({ unitId }: DataImportProps) {
           上傳【檢測結果】 (Before)
         </button>
         <button
-          onClick={() => { setImportMode('after'); setStatus('idle'); }}
+          onClick={() => { setImportMode('after'); setStatus('idle'); setLastUploadedMaint(null); }}
           className={`px-5 py-3 rounded-lg border-2 font-medium transition-all ${
             importMode === 'after' 
               ? 'bg-emerald-900/40 border-emerald-500 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.2)]'
@@ -738,7 +822,7 @@ export default function DataImport({ unitId }: DataImportProps) {
           </div>
         </div>
 
-        {status !== 'idle' && status !== 'password_required' && (
+        {status !== 'idle' && status !== 'overwrite_confirm' && (
           <div className={`mt-6 p-4 rounded-lg flex items-start gap-3 ${
             status === 'parsing' || status === 'uploading' ? 'bg-blue-900/20 text-blue-400 border border-blue-800' :
             status === 'success' ? 'bg-emerald-900/20 text-emerald-400 border border-emerald-800' :
@@ -747,10 +831,37 @@ export default function DataImport({ unitId }: DataImportProps) {
             {(status === 'parsing' || status === 'uploading') && <Loader2 className="animate-spin text-blue-500 shrink-0" />}
             {status === 'success' && <CheckCircle2 className="text-emerald-500 shrink-0" />}
             {status === 'error' && <AlertCircle className="text-red-500 shrink-0" />}
-            <div>
+            <div className="flex-1">
               <p className="font-medium whitespace-pre-line">{message}</p>
               {status === 'success' && (
-                <p className="text-sm mt-1 opacity-80">資料已成功寫入資料庫，可前往「動態演變」或「儀表板」查看最新結果。</p>
+                <p className="text-sm mt-1 opacity-80">資料已成功寫入資料庫，可前往「動態視覺檢視」或「儀表板」查看最新結果。</p>
+              )}
+              {status === 'success' && importMode === 'after' && lastUploadedMaint && lastUploadedMaint.unitId === unitId && (
+                <div className="mt-3 pt-3 border-t border-emerald-800/60 flex flex-wrap items-center gap-2.5">
+                  <span className="text-xs px-2.5 py-1 rounded bg-emerald-950/60 border border-emerald-700/60 text-emerald-200 font-mono">
+                    {lastUploadedMaint.year} 年處置統計：換管 {lastUploadedMaint.rplCount} 支 · 塞管 {lastUploadedMaint.plgCount} 支
+                  </span>
+                  {onApplyToVisual && lastUploadedMaint.ids.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => launchVisualFromMaint(lastUploadedMaint.year, lastUploadedMaint.ids)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors shadow-sm"
+                    >
+                      <PlayCircle size={14} aria-hidden="true" />
+                      前往視覺圖檢視最終處置 ({lastUploadedMaint.ids.length})
+                    </button>
+                  )}
+                  {onCompareWithDecision && (
+                    <button
+                      type="button"
+                      onClick={() => onCompareWithDecision(lastUploadedMaint.year)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold transition-colors shadow-sm"
+                    >
+                      <GitCompare size={14} aria-hidden="true" />
+                      前往處置篩選比對建議差異
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -1152,15 +1263,55 @@ export default function DataImport({ unitId }: DataImportProps) {
                 )}
               </div>
 
-              {/* 匯出 CSV 按鈕 */}
-              <button
-                onClick={() => downloadSnapshotCSV(selectedHistoryItem)}
-                disabled={historyDetailLoading || !selectedHistoryItem.records_snapshot || selectedHistoryItem.records_snapshot.length === 0}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md border border-slate-700 transition-colors disabled:opacity-50"
-              >
-                <Download size={14} />
-                下載此快照 CSV
-              </button>
+              {/* 快照操作按鈕 */}
+              <div className="flex flex-wrap items-center gap-2">
+                {selectedHistoryItem.data_type === 'maintenance' &&
+                  selectedHistoryItem.records_snapshot &&
+                  selectedHistoryItem.records_snapshot.length > 0 && (
+                    <>
+                      {onApplyToVisual && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const summary = summarizeMaintRecords(selectedHistoryItem.records_snapshot, selectedHistoryItem.year);
+                            if (summary.ids.length > 0) {
+                              setSelectedHistoryItem(null);
+                              launchVisualFromMaint(selectedHistoryItem.year, summary.ids);
+                            }
+                          }}
+                          disabled={historyDetailLoading}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-md text-xs font-semibold transition-colors disabled:opacity-50"
+                        >
+                          <PlayCircle size={14} aria-hidden="true" />
+                          視覺圖檢視最終處置
+                        </button>
+                      )}
+                      {onCompareWithDecision && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const targetYear = selectedHistoryItem.year;
+                            setSelectedHistoryItem(null);
+                            onCompareWithDecision(targetYear);
+                          }}
+                          disabled={historyDetailLoading}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-md text-xs font-semibold transition-colors disabled:opacity-50"
+                        >
+                          <GitCompare size={14} aria-hidden="true" />
+                          比對建議差異
+                        </button>
+                      )}
+                    </>
+                  )}
+                <button
+                  onClick={() => downloadSnapshotCSV(selectedHistoryItem)}
+                  disabled={historyDetailLoading || !selectedHistoryItem.records_snapshot || selectedHistoryItem.records_snapshot.length === 0}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md border border-slate-700 transition-colors disabled:opacity-50"
+                >
+                  <Download size={14} />
+                  下載此快照 CSV
+                </button>
+              </div>
             </div>
 
             {/* 搜尋過濾列 */}
@@ -1301,24 +1452,29 @@ export default function DataImport({ unitId }: DataImportProps) {
         </div>
       )}
 
-      {/* Password Modal Overlay */}
-      {status === 'password_required' && (
+      {/* Admin Overwrite Confirmation Modal Overlay */}
+      {status === 'overwrite_confirm' && (
         <div className="absolute inset-0 z-50 flex items-center justify-center -m-6 bg-slate-950/80 backdrop-blur-sm">
-          <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-6 w-[400px] max-w-full">
+          <div className="bg-slate-900 border border-slate-700 rounded-xl shadow-2xl p-6 w-[430px] max-w-full">
             <div className="flex justify-between items-center mb-4">
-              <div className="flex items-center gap-2 text-yellow-500 font-bold text-lg">
+              <div className="flex items-center gap-2 text-amber-400 font-bold text-lg">
                 <AlertCircle size={24} />
-                安全驗證 (資料庫覆寫)
+                覆寫確認 (PIMCP 管理員)
               </div>
               <button onClick={() => setStatus('idle')} className="text-slate-500 hover:text-slate-300">
                 <X size={20} />
               </button>
             </div>
             
-            <p className="text-slate-300 text-sm mb-6 leading-relaxed">
-              您上傳的資料包含<span className="text-white font-semibold mx-1">針對該機組年份已存在</span>的紀錄。
-              為了防止誤蓋舊資料，系統需要您輸入系統覆寫密碼。
+            <p className="text-slate-300 text-sm mb-4 leading-relaxed">
+              您上傳的資料包含<span className="text-white font-semibold mx-1">該機組年份已存在</span>的紀錄。
+              請再次確認是否要覆寫原有資料？
             </p>
+
+            <div className="mb-4 flex items-center gap-2 rounded-lg bg-emerald-950/40 border border-emerald-700/50 px-3 py-2 text-xs text-emerald-300">
+              <ShieldCheck size={16} className="shrink-0" />
+              <span>已驗證 PIMCP Condensor 管理員身分：{currentUserInfo.userName}</span>
+            </div>
             
             <div className="space-y-4">
               {existingNotesCount > 0 && (
@@ -1354,20 +1510,6 @@ export default function DataImport({ unitId }: DataImportProps) {
                   </div>
                 </fieldset>
               )}
-
-              <div className="relative">
-                <KeyRound className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
-                <input 
-                  type="password" 
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="請輸入授權密碼"
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg py-2.5 pl-10 pr-4 text-white focus:ring-blue-500 focus:border-blue-500 outline-none"
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') uploadRecords(pendingRecords, password);
-                  }}
-                />
-              </div>
               
               <div className="flex justify-end gap-3 pt-2">
                 <button 
@@ -1377,8 +1519,8 @@ export default function DataImport({ unitId }: DataImportProps) {
                   取消
                 </button>
                 <button 
-                  onClick={() => uploadRecords(pendingRecords, password)}
-                  className="px-4 py-2 rounded-lg text-sm bg-blue-600 hover:bg-blue-700 text-white font-medium shadow-lg transition-colors"
+                  onClick={() => uploadRecords(pendingRecords, true)}
+                  className="px-4 py-2 rounded-lg text-sm bg-amber-600 hover:bg-amber-500 text-white font-medium shadow-lg transition-colors"
                 >
                   確認覆寫
                 </button>

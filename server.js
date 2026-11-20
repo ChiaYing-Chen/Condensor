@@ -279,11 +279,11 @@ const mergeNoteStrings = (oldNote, newNote) => {
 
 // 上傳檢測紀錄（覆寫需密碼）
 app.post('/api/records/upload', async (req, res) => {
-  const { password, records, unit_id, material_updates, fileName, file_name, uploaded_by } = req.body;
+  const { records, unit_id, material_updates, fileName, file_name, uploaded_by } = req.body;
   const notesMode = req.body?.notes_mode === 'overwrite' ? 'overwrite' : 'merge';
   const uid = unit_id || 'TG-1';
   const uploadFileName = fileName || file_name || `${uid}_檢測原始資料.xlsx`;
-  const uploader = uploaded_by || '系統使用者';
+  let uploader = uploaded_by || '系統使用者';
 
   if (!records || !Array.isArray(records) || records.length === 0) {
     return res.status(400).json({ error: 'No records provided' });
@@ -313,18 +313,12 @@ app.post('/api/records/upload', async (req, res) => {
     const exists = checkResult.rows.length > 0;
 
     if (exists) {
-      if (!password || password !== OVERWRITE_PASSWORD) {
-        const notesCheck = await pool.query(
-          `SELECT COUNT(*)::int AS cnt FROM inspection_records
-           WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
-          [uid, targetYears]
-        );
-        const existingNotesCount = notesCheck.rows[0]?.cnt || 0;
-        return res.status(403).json({
-          error: '部分年份的資料已存在，覆寫需要密碼',
-          requirePassword: true,
-          existingNotesCount
-        });
+      const check = await verifyAdminOverwrite(req, uid, targetYears, 'inspection_records');
+      if (!check.allowed) {
+        return res.status(check.status).json(check.payload);
+      }
+      if (check.authInfo?.userName) {
+        uploader = check.authInfo.userName;
       }
     }
     await pool.query('BEGIN');
@@ -664,6 +658,66 @@ const checkCondensorAdmin = async (userInput) => {
   return { isAdmin: false, userId: shortId, userName: raw };
 };
 
+const extractRequestUserCandidate = (req) => {
+  const uploadedBy = String(req.body?.uploaded_by || '').trim();
+  const safeUploadedBy = uploadedBy && uploadedBy !== '系統使用者' && uploadedBy !== '訪客' ? uploadedBy : '';
+  return (
+    req.body?.operator ||
+    req.body?.clientUser ||
+    safeUploadedBy ||
+    req.query?.clientUser ||
+    req.headers['x-iisnode-logon_user'] ||
+    req.headers['x-remote-user'] ||
+    req.headers['remote-user'] ||
+    ''
+  );
+};
+
+/**
+ * 覆寫既有年份資料前，驗證是否具 PIMCP Condensor 管理人員權限及完成二次確認。
+ */
+const verifyAdminOverwrite = async (req, uid, targetYears, tableName) => {
+  const allowedTables = ['inspection_records', 'maintenance_actions'];
+  if (!allowedTables.includes(tableName)) {
+    throw new Error(`Invalid table name: ${tableName}`);
+  }
+  const authInfo = await checkCondensorAdmin(extractRequestUserCandidate(req));
+  if (!authInfo.isAdmin) {
+    return {
+      allowed: false,
+      status: 403,
+      payload: {
+        error: '權限不足：僅具 PIMCP Condensor 管理人員權限者可覆寫既有年份資料',
+        requireAdmin: true,
+        isAdmin: false,
+        userId: authInfo.userId,
+        userName: authInfo.userName,
+      },
+    };
+  }
+  if (req.body?.confirm_overwrite !== true) {
+    const notesCheck = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM ${tableName}
+       WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
+      [uid, targetYears]
+    );
+    const existingNotesCount = notesCheck.rows[0]?.cnt || 0;
+    return {
+      allowed: false,
+      status: 403,
+      payload: {
+        error: '部分年份的資料已存在，請再次確認是否覆寫',
+        requireConfirm: true,
+        isAdmin: true,
+        userId: authInfo.userId,
+        userName: authInfo.userName,
+        existingNotesCount,
+      },
+    };
+  }
+  return { allowed: true, authInfo };
+};
+
 // 查詢使用者是否為 Condensor 專案管理人員（來源為 PIMCP app_admin_permissions）
 app.get('/api/permissions/check', async (req, res) => {
   const candidate = req.query.user || req.query.clientUser || '';
@@ -870,13 +924,13 @@ app.get('/api/maintenance', async (req, res) => {
   }
 });
 
-// 上傳處置紀錄（覆寫需密碼）
+// 上傳處置紀錄（覆寫需具 PIMCP Condensor 管理人員權限並二次確認）
 app.post('/api/maintenance/upload', async (req, res) => {
-  const { password, records, unit_id, fileName, file_name, uploaded_by } = req.body;
+  const { records, unit_id, fileName, file_name, uploaded_by } = req.body;
   const notesMode = req.body?.notes_mode === 'overwrite' ? 'overwrite' : 'merge';
   const uid = unit_id || 'TG-1';
   const uploadFileName = fileName || file_name || `${uid}_大修處置結果.xlsx`;
-  const uploader = uploaded_by || '系統使用者';
+  let uploader = uploaded_by || '系統使用者';
 
   if (!records || !Array.isArray(records) || records.length === 0) {
     return res.status(400).json({ error: 'No records provided' });
@@ -905,18 +959,12 @@ app.post('/api/maintenance/upload', async (req, res) => {
     const exists = checkResult.rows.length > 0;
 
     if (exists) {
-      if (!password || password !== OVERWRITE_PASSWORD) {
-        const notesCheck = await pool.query(
-          `SELECT COUNT(*)::int AS cnt FROM maintenance_actions
-           WHERE unit_id = $1 AND year = ANY($2::int[]) AND notes IS NOT NULL AND BTRIM(notes) <> ''`,
-          [uid, targetYears]
-        );
-        const existingNotesCount = notesCheck.rows[0]?.cnt || 0;
-        return res.status(403).json({
-          error: '部分年份的處置資料已存在，覆寫需要密碼',
-          requirePassword: true,
-          existingNotesCount
-        });
+      const check = await verifyAdminOverwrite(req, uid, targetYears, 'maintenance_actions');
+      if (!check.allowed) {
+        return res.status(check.status).json(check.payload);
+      }
+      if (check.authInfo?.userName) {
+        uploader = check.authInfo.userName;
       }
     }
 

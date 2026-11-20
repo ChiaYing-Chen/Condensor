@@ -2,6 +2,9 @@ import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { Play, Pause, SkipBack, SkipForward, Layers, Loader2, Download, Table2, Image as ImageIcon, Upload, Palette, Eye, EyeOff, X, Lock, Pencil, ShieldCheck, AlertTriangle } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { generateTubeMap } from '../utils/tubeMapGenerator';
+import { VisualHighlightRequest, VisualListMode } from '../types';
+import { normalizeMaintAction, isDisposalAction, formatMaintActionLabel } from '../utils/maintenanceAction';
+import { fetchCurrentUserPermission } from '../utils/userPermission';
 
 const INSPECTION_CODE_OPTIONS = [
   { code: 'NDD', label: 'NDD - 無缺陷' },
@@ -99,6 +102,7 @@ type ViewMode = 'before' | 'after';
 interface TubeSheetCanvasProps {
   unitId: string;
   highlightTubes?: Set<string> | null;
+  highlightConfig?: VisualHighlightRequest | null;
   /** 由處置篩選系統傳入：本次篩選的目標年份，用於時間軸閃爍定位 */
   filterSourceYear?: number | null;
   /** 由處置篩選系統傳入：基準比對年份，用於時間軸閃爍定位 */
@@ -106,7 +110,7 @@ interface TubeSheetCanvasProps {
   onClearHighlight?: () => void;
 }
 
-export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYear, filterBaseYear, onClearHighlight }: TubeSheetCanvasProps) {
+export default function TubeSheetCanvas({ unitId, highlightTubes, highlightConfig, filterSourceYear, filterBaseYear, onClearHighlight }: TubeSheetCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [availableYears, setAvailableYears] = useState<number[]>([]);
   const [currentYearIndex, setCurrentYearIndex] = useState(0);
@@ -131,9 +135,10 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   const [isRendering, setIsRendering] = useState(false);
   const [showGridMarkers, setShowGridMarkers] = useState(false);
   // 處置顏色視覺功能
-  const [showDisposalColors, setShowDisposalColors] = useState(false);
+  const [showDisposalColors, setShowDisposalColors] = useState(Boolean(highlightConfig?.enableDisposalColors));
   const [showOldPlugs, setShowOldPlugs] = useState(false);
   const [showDNTOnly, setShowDNTOnly] = useState(false);
+  const [visualListMode, setVisualListMode] = useState<VisualListMode>(highlightConfig?.mode || 'suggested');
   // 快速上傳 Modal
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<'idle'|'uploading'|'success'|'error'|'password_required'>('idle');
@@ -183,6 +188,66 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
   const currentYear = availableYears.length > 0 ? availableYears[currentYearIndex] : null;
   const hasAfterData = currentYear ? maintenanceYears.includes(currentYear) : false;
 
+  const suggestedTubeSet = useMemo(() => {
+    if (highlightConfig?.suggestedIds && highlightConfig.suggestedIds.length > 0) {
+      return new Set<string>(highlightConfig.suggestedIds);
+    }
+    if (highlightConfig?.origin !== 'import' && highlightTubes && highlightTubes.size > 0) {
+      return highlightTubes;
+    }
+    return new Set<string>();
+  }, [highlightConfig, highlightTubes]);
+
+  const { finalTubeSet, finalActionCounts } = useMemo(() => {
+    const set = new Set<string>();
+    let rpl = 0;
+    let plg = 0;
+    Object.entries(maintenanceRecords).forEach(([id, rec]) => {
+      const act = normalizeMaintAction(rec?.action);
+      if (act === 'RPL') {
+        set.add(id);
+        rpl++;
+      } else if (act === 'PLG') {
+        set.add(id);
+        plg++;
+      }
+    });
+    if (
+      set.size === 0 &&
+      highlightConfig?.finalIds &&
+      highlightConfig.finalIds.length > 0 &&
+      currentYear === highlightConfig.sourceYear
+    ) {
+      highlightConfig.finalIds.forEach(id => set.add(id));
+    }
+    return { finalTubeSet: set, finalActionCounts: { rpl, plg } };
+  }, [maintenanceRecords, highlightConfig, currentYear]);
+
+  const diffBreakdown = useMemo(() => {
+    let matched = 0;
+    let added = 0;
+    let kept = 0;
+    suggestedTubeSet.forEach(id => {
+      if (finalTubeSet.has(id)) matched++;
+      else kept++;
+    });
+    finalTubeSet.forEach(id => {
+      if (!suggestedTubeSet.has(id)) added++;
+    });
+    return { matched, added, kept };
+  }, [suggestedTubeSet, finalTubeSet]);
+
+  const activeHighlightSet = useMemo<Set<string> | null>(() => {
+    if (!highlightTubes && !highlightConfig) return null;
+    if (visualListMode === 'final') return finalTubeSet;
+    if (visualListMode === 'diff') {
+      const union = new Set<string>(suggestedTubeSet);
+      finalTubeSet.forEach(id => union.add(id));
+      return union;
+    }
+    return suggestedTubeSet.size > 0 ? suggestedTubeSet : (highlightTubes || null);
+  }, [highlightTubes, highlightConfig, visualListMode, suggestedTubeSet, finalTubeSet]);
+
   // 播放步驟序列：按「每年先before，若有after則接after」展開
   const playSteps = useMemo(() => {
     const steps: Array<{ yi: number; vm: ViewMode }> = [];
@@ -194,6 +259,17 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     });
     return steps;
   }, [availableYears, maintenanceYears]);
+
+  const jumpToYearMode = (targetYear: number, preferredMode: ViewMode) => {
+    const yi = availableYears.indexOf(targetYear);
+    if (yi < 0) return;
+    const vm: ViewMode = preferredMode === 'after' && maintenanceYears.includes(targetYear) ? 'after' : 'before';
+    const si = playSteps.findIndex(s => s.yi === yi && s.vm === vm);
+    setIsPlaying(false);
+    setCurrentYearIndex(yi);
+    setViewMode(vm);
+    if (si >= 0) setPlayStepIndex(si);
+  };
 
   // Initialize: Fetch available years and tube registry for this unit
   useEffect(() => {
@@ -224,15 +300,24 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       }
       
       if (sortedYears.length > 0) {
-        let totalSteps = sortedYears.length;
-        mYears.forEach(y => { if (sortedYears.includes(y)) totalSteps++; });
-        
-        const lastYear = sortedYears[sortedYears.length - 1];
-        const hasMaint = mYears.includes(lastYear);
+        const preferredYear = highlightConfig?.sourceYear ?? filterSourceYear;
+        const targetYi = preferredYear && sortedYears.includes(preferredYear)
+          ? sortedYears.indexOf(preferredYear)
+          : sortedYears.length - 1;
+        const targetYear = sortedYears[targetYi];
+        const hasMaint = mYears.includes(targetYear);
+        const targetVm: ViewMode = hasMaint ? 'after' : 'before';
 
-        setPlayStepIndex(totalSteps - 1);
-        setCurrentYearIndex(sortedYears.length - 1);
-        setViewMode(hasMaint ? 'after' : 'before');
+        const steps: Array<{ yi: number; vm: ViewMode }> = [];
+        sortedYears.forEach((y, yi) => {
+          steps.push({ yi, vm: 'before' });
+          if (mYears.includes(y)) steps.push({ yi, vm: 'after' });
+        });
+        const stepIdx = steps.findIndex(s => s.yi === targetYi && s.vm === targetVm);
+
+        setPlayStepIndex(stepIdx >= 0 ? stepIdx : Math.max(0, steps.length - 1));
+        setCurrentYearIndex(targetYi);
+        setViewMode(targetVm);
       }
       
       const regMap: Record<string, any> = {};
@@ -246,6 +331,22 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     }).catch(console.error).finally(() => setLoading(false));
 
   }, [unitId]);
+
+  useEffect(() => {
+    if (!highlightConfig) {
+      setVisualListMode('suggested');
+      return;
+    }
+    const nextMode = highlightConfig.mode || 'suggested';
+    setVisualListMode(nextMode);
+    if (highlightConfig.enableDisposalColors !== undefined) {
+      setShowDisposalColors(highlightConfig.enableDisposalColors);
+    }
+    if (availableYears.length > 0 && highlightConfig.sourceYear && availableYears.includes(highlightConfig.sourceYear)) {
+      jumpToYearMode(highlightConfig.sourceYear, nextMode === 'final' || nextMode === 'diff' ? 'after' : viewMode);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightConfig]);
 
   // Fetch inspection (Before) & maintenance (After) records when year changes
   useEffect(() => {
@@ -453,178 +554,15 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
         cx = width - cx;
       }
       const cy = offsetY + tube.y * scale;
-
-      const record = yearRecords[tube.id];
-      const maintenance = maintenanceRecords[tube.id];
-      let code = record?.code || '';
-
-      let color = '#334155'; // default empty
-      let isBlink = false;
-      let isPlugged = false; // 提升至外層，供繪 X 使用
-      let isOldPlug = false; // 舊塞管標記（灰色圓 + 紅X）
-      
-      if (record) {
-        isPlugged = code === 'PLG';
-        let depth = record.size_val || 0;
-
-        if (viewMode === 'after') {
-          if (maintenance) {
-            if (maintenance.action === 'PLG' || maintenance.action === '塞管') {
-              isPlugged = true;
-            } else if (maintenance.action === 'RPL' || maintenance.action === '換管') {
-              isPlugged = false;
-              depth = 0;
-              code = 'NDD';
-            }
-          } else if (Object.keys(maintenanceRecords).length === 0) {
-            if (depth > 50) isPlugged = true;
-            if (code === 'COR') isPlugged = true;
-          }
-        }
-
-        let isHighlighted = false;
-        if (highlightTubes) {
-          isHighlighted = highlightTubes.has(tube.id);
-        }
-
-        if (isPlugged) {
-          color = '#64748b';
-        } else if (code === 'OBS') {
-          color = '#2563eb';
-          isBlink = true;
-        } else if (code === 'COR') {
-          color = '#ff3fa4';
-          isBlink = true;
-        } else if (code === 'BLK' || code === 'RST') {
-          color = '#ffffff';
-          isBlink = true;
-        } else {
-          if (depth <= 20) color = '#10b981';
-          else if (depth <= 40) color = '#84cc16';
-          else if (depth <= 60) color = '#eab308';
-          else if (depth <= 80) color = '#f97316';
-          else color = '#ef4444';
-        }
-
-        // 處置顏色覆蓋（在 highlightTubes 模式且為篩選清單管子且 showDisposalColors 開啟時）
-        if (showDisposalColors && highlightTubes && isHighlighted) {
-          const mRec = maintenanceRecords[tube.id];
-          if (mRec?.action === 'RPL') { color = '#ef4444'; isBlink = false; } // 換管 - 紅色
-          else if (mRec?.action === 'PLG') { color = '#e879f9'; isBlink = false; } // 塞管 - 紫粉色
-        }
-
-        if (highlightTubes && !isHighlighted) {
-           if (showGridMarkers && tube.col % 5 === 0) {
-             color = isPrintMode ? '#3b82f6' : '#cbd5e1'; // 列印模式改為鮮明藍色
-           } else {
-             color = isPrintMode ? '#e2e8f0' : '#1e293b'; // 列印模式改為淡灰色
-           }
-           isBlink = false; // 未強調管絕對不能閃爍
-        }
-      } else if (registryRecords[tube.id]?.status === 'plugged') {
-        // 舊塞管：showDisposalColors && showOldPlugs 同時 ON → 灰色圓 + 紅X，否則融入背景
-        const showOldPlugStyle = showDisposalColors && showOldPlugs;
-        color = isPrintMode ? '#cbd5e1' : (showOldPlugStyle ? '#64748b' : '#1e293b');
-        if (showOldPlugStyle) isOldPlug = true;
-        let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : false;
-        if (highlightTubes && !isHighlighted) {
-           color = (showGridMarkers && tube.col % 5 === 0)
-             ? (isPrintMode ? '#3b82f6' : '#cbd5e1')
-             : (isPrintMode ? '#e2e8f0' : '#1e293b');
-           isOldPlug = false;
-        }
-      } else {
-        // 列印模式下無資料管呈淡灰
-        color = isPrintMode ? '#d1d5db' : '#334155';
-        let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : false;
-        if (highlightTubes && !isHighlighted) {
-           color = (showGridMarkers && tube.col % 5 === 0) 
-             ? (isPrintMode ? '#3b82f6' : '#cbd5e1') 
-             : (isPrintMode ? '#e2e8f0' : '#1e293b');
-        }
-      }
-
-      const isDNTTube = record && (code === 'DNT' || (record.notes && record.notes.includes('DNT')));
-
-      if (showDNTOnly) {
-        let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : true;
-        if (isDNTTube && isHighlighted) {
-          isBlink = true;
-        } else {
-          color = isPrintMode ? '#e2e8f0' : '#1e293b';
-          isBlink = false;
-          isOldPlug = false;
-        }
-      }
-
-      // 閃爍定律：這幀 frame 若是隱居相則不畫
-      if (isBlink && !blinkVisible) return;
-
-      if (record && code === 'DNT') {
-          let isHighlighted = highlightTubes ? highlightTubes.has(tube.id) : false;
-          let isMuted = false;
-          if (highlightTubes && !isHighlighted) isMuted = true;
-          if (showDNTOnly && !(isDNTTube && (!highlightTubes || isHighlighted))) isMuted = true;
-
-          if (isMuted) {
-            // 在篩選強調節點模式中且未被強調，畫為一般黯淡灰圈 或 網格線
-            ctx.fillStyle = (showGridMarkers && tube.col % 5 === 0) 
-              ? (isPrintMode ? '#3b82f6' : '#cbd5e1') 
-              : (isPrintMode ? '#e2e8f0' : '#1e293b');
-            ctx.beginPath();
-            ctx.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
-            ctx.fill();
-          } else {
-            // 管凹陷 (DNT)：外圈標準藍色，內圓依深度
-            let innerColor = '#10b981';
-            const depth = record.size_val || 0;
-            if (depth <= 20) innerColor = '#10b981';
-            else if (depth <= 40) innerColor = '#84cc16';
-            else if (depth <= 60) innerColor = '#eab308';
-            else if (depth <= 80) innerColor = '#f97316';
-            else innerColor = '#ef4444';
-
-            ctx.fillStyle = '#2563eb'; // 標準藍色外圈
-            ctx.beginPath();
-            ctx.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
-            ctx.fill();
-            
-            ctx.fillStyle = innerColor; // 內圓依深度 (稍微縮小讓外圈變細)
-            ctx.beginPath();
-            ctx.arc(cx, cy, tubeRadius * 0.85, 0, Math.PI * 2);
-            ctx.fill();
-          }
-      } else {
-          ctx.fillStyle = color;
-          ctx.beginPath();
-          ctx.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
-          ctx.fill();
-      }
-
-      // 已塞管 / 舊塞管：疊加紅色 X 標記
-      if ((isPlugged || isOldPlug) && color !== '#1e293b') {
-        const xSize = tubeRadius * 0.55;
-        const xLW = Math.max(1, tubeRadius * 0.35);
-        ctx.save();
-        ctx.strokeStyle = '#ef4444';
-        ctx.lineWidth = xLW;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(cx - xSize, cy - xSize);
-        ctx.lineTo(cx + xSize, cy + xSize);
-        ctx.moveTo(cx + xSize, cy - xSize);
-        ctx.lineTo(cx - xSize, cy + xSize);
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      if (hoveredTube && hoveredTube.id === tube.id) {
-        ctx.strokeStyle = '#fff';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(cx, cy, tubeRadius + 2, 0, Math.PI * 2);
-        ctx.stroke();
-      }
+      renderTubeOnContext({
+        c: ctx,
+        tube,
+        cx,
+        cy,
+        tubeRadius,
+        isPrintMode,
+        blinkVisible,
+      });
     });
 
     if (annotationText) {
@@ -637,6 +575,234 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
       ctx.textBaseline = 'top';
       ctx.fillText(annotationText, 18, 14);
       ctx.restore();
+    }
+  };
+
+  const renderTubeOnContext = ({
+    c,
+    tube,
+    cx,
+    cy,
+    tubeRadius,
+    isPrintMode,
+    blinkVisible,
+  }: {
+    c: CanvasRenderingContext2D;
+    tube: any;
+    cx: number;
+    cy: number;
+    tubeRadius: number;
+    isPrintMode: boolean;
+    blinkVisible: boolean;
+  }) => {
+    const record = yearRecords[tube.id];
+    const maintenance = maintenanceRecords[tube.id];
+    const maintAction = normalizeMaintAction(maintenance?.action);
+    let code = record?.code || '';
+
+    let color = isPrintMode ? '#d1d5db' : '#334155';
+    let isBlink = false;
+    let isPlugged = false;
+    let isOldPlug = false;
+    let disposalColorApplied = false;
+
+    const isHighlighted = activeHighlightSet ? activeHighlightSet.has(tube.id) : false;
+    const inSug = suggestedTubeSet.has(tube.id);
+    const inFin = finalTubeSet.has(tube.id);
+    const diffRole: 'matched' | 'added' | 'kept' | 'none' =
+      activeHighlightSet && visualListMode === 'diff'
+        ? (inSug && inFin ? 'matched' : inFin ? 'added' : inSug ? 'kept' : 'none')
+        : 'none';
+
+    const mutedColor = (showGridMarkers && tube.col % 5 === 0)
+      ? (isPrintMode ? '#3b82f6' : '#cbd5e1')
+      : (isPrintMode ? '#e2e8f0' : '#1e293b');
+
+    const isDNTTube = Boolean(record && (code === 'DNT' || (record.notes && record.notes.includes('DNT'))));
+
+    // 差異對照模式：建議處置但最終評估保留 → 畫虛線空心圈
+    if (diffRole === 'kept' && (!showDNTOnly || isDNTTube)) {
+      c.save();
+      c.fillStyle = isPrintMode ? 'rgba(100,116,139,0.16)' : 'rgba(148,163,184,0.18)';
+      c.beginPath();
+      c.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
+      c.fill();
+      c.strokeStyle = isPrintMode ? '#475569' : '#94a3b8';
+      c.lineWidth = Math.max(1.2, tubeRadius * 0.36);
+      c.setLineDash([Math.max(2, tubeRadius * 0.55), Math.max(1.5, tubeRadius * 0.45)]);
+      c.beginPath();
+      c.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
+      c.stroke();
+      c.restore();
+      if (!isPrintMode && hoveredTube && hoveredTube.id === tube.id) {
+        c.strokeStyle = '#fff';
+        c.lineWidth = 2;
+        c.beginPath();
+        c.arc(cx, cy, tubeRadius + 2, 0, Math.PI * 2);
+        c.stroke();
+      }
+      return;
+    }
+
+    if (record) {
+      isPlugged = code === 'PLG';
+      let depth = record.size_val || 0;
+
+      if (viewMode === 'after') {
+        if (maintenance) {
+          if (maintAction === 'PLG') {
+            isPlugged = true;
+          } else if (maintAction === 'RPL') {
+            isPlugged = false;
+            depth = 0;
+            code = 'NDD';
+          }
+        } else if (Object.keys(maintenanceRecords).length === 0) {
+          if (depth > 50) isPlugged = true;
+          if (code === 'COR') isPlugged = true;
+        }
+      }
+
+      if (isPlugged) {
+        color = isPrintMode ? '#cbd5e1' : '#64748b';
+      } else if (code === 'OBS') {
+        color = '#2563eb';
+        isBlink = true;
+      } else if (code === 'COR') {
+        color = '#ff3fa4';
+        isBlink = true;
+      } else if (code === 'BLK' || code === 'RST') {
+        color = isPrintMode ? '#94a3b8' : '#ffffff';
+        isBlink = true;
+      } else {
+        if (depth <= 20) color = '#10b981';
+        else if (depth <= 40) color = '#84cc16';
+        else if (depth <= 60) color = '#eab308';
+        else if (depth <= 80) color = '#f97316';
+        else color = '#ef4444';
+      }
+
+      if (showDisposalColors && activeHighlightSet && isHighlighted) {
+        if (maintAction === 'RPL') { color = '#ef4444'; isBlink = false; disposalColorApplied = true; }
+        else if (maintAction === 'PLG') { color = '#e879f9'; isBlink = false; disposalColorApplied = true; }
+      }
+
+      if (activeHighlightSet && !isHighlighted) {
+        color = mutedColor;
+        isBlink = false;
+        isPlugged = false;
+      }
+    } else if (registryRecords[tube.id]?.status === 'plugged') {
+      const showOldPlugStyle = showDisposalColors && showOldPlugs;
+      color = isPrintMode
+        ? (showOldPlugStyle ? '#64748b' : '#cbd5e1')
+        : (showOldPlugStyle ? '#64748b' : '#1e293b');
+      if (showOldPlugStyle) isOldPlug = true;
+
+      if (showDisposalColors && activeHighlightSet && isHighlighted) {
+        if (maintAction === 'RPL') { color = '#ef4444'; isOldPlug = false; disposalColorApplied = true; }
+        else if (maintAction === 'PLG') { color = '#e879f9'; isPlugged = true; isOldPlug = false; disposalColorApplied = true; }
+      }
+
+      if (activeHighlightSet && !isHighlighted) {
+        color = mutedColor;
+        isOldPlug = false;
+      }
+    } else {
+      color = isPrintMode ? '#d1d5db' : '#334155';
+      if (showDisposalColors && activeHighlightSet && isHighlighted) {
+        if (maintAction === 'RPL') { color = '#ef4444'; disposalColorApplied = true; }
+        else if (maintAction === 'PLG') { color = '#e879f9'; isPlugged = true; disposalColorApplied = true; }
+      }
+      if (activeHighlightSet && !isHighlighted) {
+        color = mutedColor;
+      }
+    }
+
+    if (showDNTOnly) {
+      const allowedByHighlight = activeHighlightSet ? isHighlighted : true;
+      if (isDNTTube && allowedByHighlight) {
+        isBlink = !isPrintMode;
+      } else {
+        color = isPrintMode ? '#e2e8f0' : '#1e293b';
+        isBlink = false;
+        isOldPlug = false;
+        isPlugged = false;
+      }
+    }
+
+    if (!isPrintMode && isBlink && !blinkVisible) return;
+
+    if (record && code === 'DNT' && !disposalColorApplied) {
+      const isMuted = Boolean(
+        (activeHighlightSet && !isHighlighted) ||
+        (showDNTOnly && !(isDNTTube && (!activeHighlightSet || isHighlighted)))
+      );
+
+      if (isMuted) {
+        c.fillStyle = mutedColor;
+        c.beginPath();
+        c.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
+        c.fill();
+      } else {
+        let innerColor = '#10b981';
+        const depth = record.size_val || 0;
+        if (depth <= 20) innerColor = '#10b981';
+        else if (depth <= 40) innerColor = '#84cc16';
+        else if (depth <= 60) innerColor = '#eab308';
+        else if (depth <= 80) innerColor = '#f97316';
+        else innerColor = '#ef4444';
+
+        c.fillStyle = '#2563eb';
+        c.beginPath();
+        c.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
+        c.fill();
+
+        c.fillStyle = innerColor;
+        c.beginPath();
+        c.arc(cx, cy, tubeRadius * 0.85, 0, Math.PI * 2);
+        c.fill();
+      }
+    } else {
+      c.fillStyle = color;
+      c.beginPath();
+      c.arc(cx, cy, tubeRadius, 0, Math.PI * 2);
+      c.fill();
+    }
+
+    if ((isPlugged || isOldPlug) && color !== '#1e293b' && color !== '#e2e8f0') {
+      const xSize = tubeRadius * 0.55;
+      const xLW = Math.max(isPrintMode ? 0.8 : 1, tubeRadius * 0.35);
+      c.save();
+      c.strokeStyle = isPrintMode ? '#dc2626' : '#ef4444';
+      c.lineWidth = xLW;
+      c.lineCap = 'round';
+      c.beginPath();
+      c.moveTo(cx - xSize, cy - xSize);
+      c.lineTo(cx + xSize, cy + xSize);
+      c.moveTo(cx + xSize, cy - xSize);
+      c.lineTo(cx - xSize, cy + xSize);
+      c.stroke();
+      c.restore();
+    }
+
+    // 決策額外新增（非建議清單，但實際執行處置）：疊加醒目金色外框
+    if (diffRole === 'added' && (!showDNTOnly || isDNTTube)) {
+      c.save();
+      c.strokeStyle = isPrintMode ? '#d97706' : '#facc15';
+      c.lineWidth = Math.max(1.5, tubeRadius * 0.42);
+      c.beginPath();
+      c.arc(cx, cy, tubeRadius + Math.max(1.8, tubeRadius * 0.42), 0, Math.PI * 2);
+      c.stroke();
+      c.restore();
+    }
+
+    if (!isPrintMode && hoveredTube && hoveredTube.id === tube.id) {
+      c.strokeStyle = '#fff';
+      c.lineWidth = 2;
+      c.beginPath();
+      c.arc(cx, cy, tubeRadius + 2, 0, Math.PI * 2);
+      c.stroke();
     }
   };
 
@@ -658,94 +824,12 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tubes, quadrantFilter, yearRecords, maintenanceRecords, registryRecords, hoveredTube, viewMode, highlightTubes, showGridMarkers, showDisposalColors, showOldPlugs, showDNTOnly]);
+  }, [tubes, quadrantFilter, yearRecords, maintenanceRecords, registryRecords, hoveredTube, viewMode, activeHighlightSet, visualListMode, suggestedTubeSet, finalTubeSet, showGridMarkers, showDisposalColors, showOldPlugs, showDNTOnly]);
 
 
   const resolveCurrentUserPermission = async (candidateUser?: string) => {
-    let identifier = String(candidateUser || '').trim();
-
-    if (!identifier) {
-      try {
-        const whoamiRes = await fetch('/PIMCP/api/auth/whoami', { credentials: 'include' });
-        if (whoamiRes.ok) {
-          const whoamiData = await whoamiRes.json();
-          const iisUser = String(whoamiData?.iisUser || '').trim();
-          if (iisUser && iisUser.toLowerCase() !== 'guest') {
-            identifier = iisUser;
-          }
-        }
-      } catch {
-        // 略過，繼續嘗試其他身分探測
-      }
-    }
-
-    if (!identifier) {
-      try {
-        const aspxRes = await fetch(`/PIMCP/whoami.aspx?t=${Date.now()}`, { credentials: 'include' });
-        if (aspxRes.ok) {
-          const aspxData = await aspxRes.json();
-          const rawName = String(aspxData?.raw || aspxData?.username || '').trim();
-          if (rawName && rawName !== '匿名') {
-            identifier = rawName;
-          }
-        }
-      } catch {
-        // 略過
-      }
-    }
-
-    if (!identifier) {
-      const cached =
-        localStorage.getItem('unified_user_name') ||
-        localStorage.getItem('pages_manual_user') ||
-        localStorage.getItem('appUserName') ||
-        '';
-      if (cached && cached !== '匿名') {
-        identifier = cached;
-      }
-    }
-
-    if (!identifier) {
-      setCurrentUserInfo({ userId: '', userName: '訪客', isAdmin: false });
-      return;
-    }
-
-    try {
-      const permRes = await fetch(
-        `${import.meta.env.BASE_URL}api/permissions/check?user=${encodeURIComponent(identifier)}`
-      );
-      if (permRes.ok) {
-        const permData = await permRes.json();
-        setCurrentUserInfo({
-          userId: permData.userId || identifier,
-          userName: permData.userName || identifier,
-          isAdmin: Boolean(permData.isAdmin),
-        });
-        return;
-      }
-    } catch {
-      // 嘗試透過 PIMCP API 確認權限
-    }
-
-    const shortId = identifier.split('\\').pop()?.trim() || identifier;
-    try {
-      const pimcpPermRes = await fetch(`/PIMCP/api/app-permissions/condensor/${encodeURIComponent(shortId)}`, {
-        credentials: 'include',
-      });
-      if (pimcpPermRes.ok) {
-        const pimcpData = await pimcpPermRes.json();
-        setCurrentUserInfo({
-          userId: shortId,
-          userName: identifier,
-          isAdmin: Boolean(pimcpData?.data?.isAdmin),
-        });
-        return;
-      }
-    } catch {
-      // 無法取得授權狀態時維持一般使用者權限
-    }
-
-    setCurrentUserInfo({ userId: shortId, userName: identifier, isAdmin: false });
+    const info = await fetchCurrentUserPermission(candidateUser);
+    setCurrentUserInfo(info);
   };
 
   useEffect(() => {
@@ -1100,7 +1184,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
 
   const handleDownloadImage = () => {
     const quadrantsDesc = quadrantFilter === 'ALL' ? '全部' : quadrantFilter;
-    const filterMode = highlightTubes ? 'filtered' : 'full';
+    const filterMode = activeHighlightSet ? visualListMode : 'full';
     const mainCanvas = canvasRef.current;
     if (!mainCanvas) return;
 
@@ -1174,121 +1258,93 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
         let cx = ox + tube.x * sc;
         if (mirrored) cx = W - cx;
         const cy = oy + tube.y * sc;
-        const rec = yearRecords[tube.id];
-        const maint = maintenanceRecords[tube.id];
-        const code = rec?.code || '';
-        let color = '#d1d5db';
-        let isPlg = false; // 提升至外層
-        if (rec) {
-          isPlg = code==='PLG'; let depth=rec.size_val||0;
-          if (viewMode==='after') {
-            if (maint) { if (maint.action==='PLG') isPlg=true; else if (maint.action==='RPL'){isPlg=false;depth=0;} }
-            else { if (depth>50) isPlg=true; if (code==='COR') isPlg=true; }
-          }
-          const isHL = highlightTubes?highlightTubes.has(tube.id):false;
-          if (isPlg) color='#cbd5e1';
-          else if (code==='OBS') color='#2563eb';
-          else if (code==='COR') color='#ff3fa4';
-          else if (code==='BLK'||code==='RST') color='#94a3b8';
-          else { if (depth<=20) color='#10b981'; else if (depth<=40) color='#84cc16'; else if (depth<=60) color='#eab308'; else if (depth<=80) color='#f97316'; else color='#ef4444'; }
-          // 處置顏色覆蓋（showDisposalColors ON 且為篩選清單管子）
-          if (showDisposalColors && highlightTubes && isHL) {
-            if (maint?.action==='RPL') { color='#ef4444'; } // 換管 - 紅色
-            else if (maint?.action==='PLG') { color='#e879f9'; } // 塞管 - 紫粉色
-          }
-          if (highlightTubes&&!isHL) color=(showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0';
-        } else if (registryRecords[tube.id]?.status==='plugged') {
-          // 舊塞管：showDisposalColors && showOldPlugs → 灰色圓 + 紅X，否則淡灰
-          const showOldStyle = showDisposalColors && showOldPlugs;
-          const skipByHL = highlightTubes && !highlightTubes.has(tube.id);
-          color = skipByHL
-            ? ((showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0')
-            : (showOldStyle ? '#64748b' : '#cbd5e1');
-          const drawOldX = showOldStyle && !skipByHL;
-          oc.fillStyle=color; oc.beginPath(); oc.arc(cx,cy,tr,0,Math.PI*2); oc.fill();
-          if (drawOldX) {
-            const xs=tr*0.55; const xlw=Math.max(0.8,tr*0.35);
-            oc.save(); oc.strokeStyle='#dc2626'; oc.lineWidth=xlw; oc.lineCap='round';
-            oc.beginPath(); oc.moveTo(cx-xs,cy-xs); oc.lineTo(cx+xs,cy+xs);
-            oc.moveTo(cx+xs,cy-xs); oc.lineTo(cx-xs,cy+xs); oc.stroke(); oc.restore();
-          }
-          return; // 舊塞管已自行繪製，跳過後續公用邏輯
-        } else {
-          color='#d1d5db';
-          if (highlightTubes&&!highlightTubes.has(tube.id)) color=(showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0';
-        }
-        if (rec&&code==='DNT') {
-          const isHL=highlightTubes?highlightTubes.has(tube.id):false;
-          if (highlightTubes&&!isHL) {
-            oc.fillStyle=(showGridMarkers&&tube.col%5===0)?'#3b82f6':'#e2e8f0';
-            oc.beginPath(); oc.arc(cx,cy,tr,0,Math.PI*2); oc.fill();
-          } else {
-            const d=rec.size_val||0; let ic='#10b981';
-            if (d<=20) ic='#10b981'; else if (d<=40) ic='#84cc16'; else if (d<=60) ic='#eab308'; else if (d<=80) ic='#f97316'; else ic='#ef4444';
-            oc.fillStyle='#2563eb'; oc.beginPath(); oc.arc(cx,cy,tr,0,Math.PI*2); oc.fill();
-            oc.fillStyle=ic; oc.beginPath(); oc.arc(cx,cy,tr*0.85,0,Math.PI*2); oc.fill();
-          }
-        } else {
-          oc.fillStyle=color; oc.beginPath(); oc.arc(cx,cy,tr,0,Math.PI*2); oc.fill();
-        }
-        // 已塞管：疊加紅色 X（列印版）
-        if (isPlg) {
-          const xs = tr * 0.55; const xlw = Math.max(0.8, tr * 0.35);
-          oc.save(); oc.strokeStyle='#dc2626'; oc.lineWidth=xlw; oc.lineCap='round';
-          oc.beginPath(); oc.moveTo(cx-xs,cy-xs); oc.lineTo(cx+xs,cy+xs);
-          oc.moveTo(cx+xs,cy-xs); oc.lineTo(cx-xs,cy+xs); oc.stroke(); oc.restore();
-        }
+        renderTubeOnContext({
+          c: oc,
+          tube,
+          cx,
+          cy,
+          tubeRadius: tr,
+          isPrintMode: true,
+          blinkVisible: true,
+        });
       });
 
       // title
       oc.save(); oc.fillStyle='#0f172a'; oc.font='bold 26px sans-serif';
       oc.textAlign='left'; oc.textBaseline='top'; oc.fillText(label,18,14); oc.restore();
 
-      // LEGEND（處置顏色 ON 時才繪製）
-      if (showDisposalColors) {
-        type LegendItem = { color: string; label: string; isOldPlug?: boolean };
+      // LEGEND（處置顏色 ON 或差異對照模式時繪製）
+      if (showDisposalColors || (activeHighlightSet && visualListMode === 'diff')) {
+        type LegendItem = { color: string; label: string; isOldPlug?: boolean; isAddedRing?: boolean; isKeptDash?: boolean };
         const legendItems: LegendItem[] = [
-          { color: '#ef4444', label: '換管' },
-          { color: '#e879f9', label: '塞管' },
-          ...(showOldPlugs ? [{ color: '#64748b', label: '舊塞管', isOldPlug: true }] : []),
+          ...(showDisposalColors ? [
+            { color: '#ef4444', label: '換管' },
+            { color: '#e879f9', label: '塞管' },
+          ] : []),
+          ...(showDisposalColors && showOldPlugs ? [{ color: '#64748b', label: '舊塞管', isOldPlug: true }] : []),
+          ...(activeHighlightSet && visualListMode === 'diff' ? [
+            { color: '#facc15', label: '額外新增', isAddedRing: true },
+            { color: '#94a3b8', label: '建議保留', isKeptDash: true },
+          ] : []),
         ];
-        const dotR = 7;
-        const itemW = 80;
-        const legendW = legendItems.length * itemW + 16;
-        const legendH = 32;
-        const lx = W - legendW - 12;
-        const ly = H - legendH - 12;
+        if (legendItems.length > 0) {
+          const dotR = 7;
+          const itemW = 92;
+          const legendW = legendItems.length * itemW + 16;
+          const legendH = 32;
+          const lx = W - legendW - 12;
+          const ly = H - legendH - 12;
 
-        // 背景
-        oc.save();
-        oc.fillStyle = 'rgba(15,23,42,0.75)';
-        oc.beginPath();
-        (oc as any).roundRect?.(lx, ly, legendW, legendH, 6) || oc.rect(lx, ly, legendW, legendH);
-        oc.fill();
-
-        // 項目
-        oc.font = 'bold 12px sans-serif';
-        oc.textBaseline = 'middle';
-        legendItems.forEach((item, i) => {
-          const ix = lx + 12 + i * itemW;
-          const iy = ly + legendH / 2;
-          // 圓點
-          oc.fillStyle = item.color;
+          // 背景
+          oc.save();
+          oc.fillStyle = 'rgba(15,23,42,0.82)';
           oc.beginPath();
-          oc.arc(ix, iy, dotR, 0, Math.PI * 2);
+          (oc as any).roundRect?.(lx, ly, legendW, legendH, 6) || oc.rect(lx, ly, legendW, legendH);
           oc.fill();
-          // 舊塞管：疊加紅色 X
-          if (item.isOldPlug) {
-            const xs = dotR * 0.6; const xlw = Math.max(0.8, dotR * 0.35);
-            oc.strokeStyle = '#dc2626'; oc.lineWidth = xlw; oc.lineCap = 'round';
-            oc.beginPath(); oc.moveTo(ix-xs,iy-xs); oc.lineTo(ix+xs,iy+xs);
-            oc.moveTo(ix+xs,iy-xs); oc.lineTo(ix-xs,iy+xs); oc.stroke();
-          }
-          oc.fillStyle = '#f8fafc';
-          oc.textAlign = 'left';
-          oc.fillText(item.label, ix + dotR + 4, iy);
-        });
-        oc.restore();
+
+          // 項目
+          oc.font = 'bold 12px sans-serif';
+          oc.textBaseline = 'middle';
+          legendItems.forEach((item, i) => {
+            const ix = lx + 14 + i * itemW;
+            const iy = ly + legendH / 2;
+            if (item.isKeptDash) {
+              oc.save();
+              oc.strokeStyle = '#cbd5e1';
+              oc.lineWidth = 1.8;
+              oc.setLineDash([3, 2]);
+              oc.beginPath();
+              oc.arc(ix, iy, dotR, 0, Math.PI * 2);
+              oc.stroke();
+              oc.restore();
+            } else if (item.isAddedRing) {
+              oc.fillStyle = '#e879f9';
+              oc.beginPath();
+              oc.arc(ix, iy, dotR - 1.5, 0, Math.PI * 2);
+              oc.fill();
+              oc.strokeStyle = '#facc15';
+              oc.lineWidth = 2;
+              oc.beginPath();
+              oc.arc(ix, iy, dotR + 1.5, 0, Math.PI * 2);
+              oc.stroke();
+            } else {
+              oc.fillStyle = item.color;
+              oc.beginPath();
+              oc.arc(ix, iy, dotR, 0, Math.PI * 2);
+              oc.fill();
+              if (item.isOldPlug) {
+                const xs = dotR * 0.6; const xlw = Math.max(0.8, dotR * 0.35);
+                oc.strokeStyle = '#dc2626'; oc.lineWidth = xlw; oc.lineCap = 'round';
+                oc.beginPath(); oc.moveTo(ix-xs,iy-xs); oc.lineTo(ix+xs,iy+xs);
+                oc.moveTo(ix+xs,iy-xs); oc.lineTo(ix-xs,iy+xs); oc.stroke();
+              }
+            }
+            oc.fillStyle = '#f8fafc';
+            oc.textAlign = 'left';
+            oc.fillText(item.label, ix + dotR + 6, iy);
+          });
+          oc.restore();
+        }
       }
 
       return off.toDataURL('image/png');
@@ -1306,13 +1362,82 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
 
   return (
     <div className="space-y-6">
-      {highlightTubes && (
+      {activeHighlightSet && (
         <div className="bg-indigo-900/40 border border-indigo-700 rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-y-2 shadow-lg mb-2">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <span className="text-xl">🔍</span>
-            <span className="text-indigo-200 font-medium tracking-wide">
-              正在檢視篩選清單的重點管束 <span className="font-bold text-white bg-indigo-800 px-2 py-0.5 rounded ml-1">共 {highlightTubes.size} 支</span>
-            </span>
+            {suggestedTubeSet.size > 0 && (hasAfterData || finalTubeSet.size > 0) ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-indigo-200 font-medium text-sm">檢視來源：</span>
+                <div className="inline-flex rounded-lg border border-indigo-700/70 bg-slate-950/70 p-0.5">
+                  <button
+                    type="button"
+                    onClick={() => setVisualListMode('suggested')}
+                    className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
+                      visualListMode === 'suggested'
+                        ? 'bg-indigo-600 text-white shadow'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    建議處置 ({suggestedTubeSet.size})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVisualListMode('final');
+                      setShowDisposalColors(true);
+                      if (hasAfterData && viewMode !== 'after') setViewMode('after');
+                    }}
+                    className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
+                      visualListMode === 'final'
+                        ? 'bg-emerald-600 text-white shadow'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    最終處置 After ({finalTubeSet.size})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVisualListMode('diff');
+                      setShowDisposalColors(true);
+                      if (hasAfterData && viewMode !== 'after') setViewMode('after');
+                    }}
+                    className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
+                      visualListMode === 'diff'
+                        ? 'bg-amber-600 text-white shadow'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    建議 vs 最終差異
+                  </button>
+                </div>
+                {visualListMode === 'diff' && (
+                  <span className="text-xs text-slate-300 font-mono bg-slate-900/80 border border-slate-700 px-2.5 py-1 rounded">
+                    依建議 {diffBreakdown.matched} · 新增 +{diffBreakdown.added} · 保留 -{diffBreakdown.kept}
+                  </span>
+                )}
+                {visualListMode === 'final' && (
+                  <span className="text-xs text-emerald-300 font-mono bg-emerald-950/60 border border-emerald-800/60 px-2.5 py-1 rounded">
+                    換管 {finalActionCounts.rpl} · 塞管 {finalActionCounts.plg}
+                  </span>
+                )}
+              </div>
+            ) : visualListMode === 'final' ? (
+              <span className="text-emerald-200 font-medium tracking-wide">
+                正在檢視最終大修處置 (After)
+                <span className="font-bold text-white bg-emerald-800 px-2 py-0.5 rounded ml-2">共 {activeHighlightSet.size} 支</span>
+                {(finalActionCounts.rpl > 0 || finalActionCounts.plg > 0) && (
+                  <span className="text-xs text-emerald-300 ml-2 font-mono">
+                    (換管 {finalActionCounts.rpl} · 塞管 {finalActionCounts.plg})
+                  </span>
+                )}
+              </span>
+            ) : (
+              <span className="text-indigo-200 font-medium tracking-wide">
+                正在檢視篩選清單的重點管束 <span className="font-bold text-white bg-indigo-800 px-2 py-0.5 rounded ml-1">共 {activeHighlightSet.size} 支</span>
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2 flex-wrap">
             {/* 情境 A/B 二選一 */}
@@ -1339,11 +1464,15 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                     {showOldPlugs ? <Eye size={14}/> : <EyeOff size={14}/>} 舊塞管
                   </button>
                 )}
-                {showDisposalColors && (
-                  <div className="flex items-center gap-2 text-xs text-slate-300 bg-slate-800/60 px-3 py-1.5 rounded-md border border-slate-700">
-                    <span className="inline-block w-3 h-3 rounded-full bg-red-500"/>換管
-                    <span className="inline-block w-3 h-3 rounded-full bg-fuchsia-400 ml-1"/>塞管
-                    {showOldPlugs && (
+                {(showDisposalColors || visualListMode === 'diff') && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300 bg-slate-800/60 px-3 py-1.5 rounded-md border border-slate-700">
+                    {showDisposalColors && (
+                      <>
+                        <span className="inline-flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full bg-red-500"/>換管</span>
+                        <span className="inline-flex items-center gap-1 ml-1"><span className="inline-block w-3 h-3 rounded-full bg-fuchsia-400"/>塞管</span>
+                      </>
+                    )}
+                    {showDisposalColors && showOldPlugs && (
                       <span className="inline-flex items-center gap-1 ml-1">
                         <span className="relative inline-flex items-center justify-center w-3 h-3">
                           <span className="absolute inset-0 rounded-full bg-slate-500"/>
@@ -1351,6 +1480,18 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                         </span>
                         舊塞管
                       </span>
+                    )}
+                    {visualListMode === 'diff' && (
+                      <>
+                        <span className="inline-flex items-center gap-1 ml-1">
+                          <span className="inline-block w-3 h-3 rounded-full border-2 border-yellow-400 bg-fuchsia-400/80"/>
+                          額外新增
+                        </span>
+                        <span className="inline-flex items-center gap-1 ml-1">
+                          <span className="inline-block w-3 h-3 rounded-full border border-dashed border-slate-400 bg-slate-400/20"/>
+                          建議保留
+                        </span>
+                      </>
                     )}
                   </div>
                 )}
@@ -1650,15 +1791,15 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                 // 本次比對年份(amber) 與 基準比對年份(violet) 分別標記
                 const isSourceTarget =
                   filterSourceYear != null &&
-                  highlightTubes != null &&
-                  highlightTubes.size > 0 &&
+                  activeHighlightSet != null &&
+                  activeHighlightSet.size > 0 &&
                   year === filterSourceYear &&
                   availableYears.includes(filterSourceYear);
 
                 const isBaseTarget =
                   filterBaseYear != null &&
-                  highlightTubes != null &&
-                  highlightTubes.size > 0 &&
+                  activeHighlightSet != null &&
+                  activeHighlightSet.size > 0 &&
                   year === filterBaseYear &&
                   availableYears.includes(filterBaseYear);
 
@@ -1722,7 +1863,7 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
 
               {/* ── 情境 A：時間軸上不存在的年份 → 末端顯示預期閃爍點 */}
               {(() => {
-                if (!highlightTubes || highlightTubes.size === 0) return null;
+                if (!activeHighlightSet || activeHighlightSet.size === 0) return null;
                 // 收集兩個比較年份中，時間軸上不存在的年份
                 const futureYears: Array<{ year: number; isSource: boolean }> = [];
                 if (filterSourceYear != null && !availableYears.includes(filterSourceYear)) {
@@ -1829,6 +1970,34 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                 <span>位置: {hoveredTube.zone} / 行 {hoveredTube.row} / 列 {hoveredTube.col}</span>
                 <span className="text-xs px-2 py-0.5 bg-slate-700 rounded-full text-slate-300">{unitId}</span>
               </div>
+
+              {activeHighlightSet && (() => {
+                const inSug = suggestedTubeSet.has(hoveredTube.id);
+                const inFin = finalTubeSet.has(hoveredTube.id);
+                if (!inSug && !inFin) return null;
+                let badgeLabel = '📋 建議處置管束';
+                let badgeClass = 'bg-indigo-950/70 border-indigo-700/60 text-indigo-200';
+                if (visualListMode === 'diff' || (inSug && hasAfterData)) {
+                  if (inSug && inFin) {
+                    badgeLabel = '✅ 依建議執行最終處置';
+                    badgeClass = 'bg-emerald-950/70 border-emerald-700/60 text-emerald-300';
+                  } else if (inFin) {
+                    badgeLabel = '➕ 決策額外新增處置（未達建議公式）';
+                    badgeClass = 'bg-amber-950/70 border-amber-600/60 text-amber-300';
+                  } else if (inSug && hasAfterData) {
+                    badgeLabel = '➖ 建議處置但最終評估保留';
+                    badgeClass = 'bg-slate-900 border-slate-600 text-slate-300';
+                  }
+                } else if (inFin) {
+                  badgeLabel = '🛠️ 最終大修處置 (After)';
+                  badgeClass = 'bg-emerald-950/70 border-emerald-700/60 text-emerald-300';
+                }
+                return (
+                  <div className={`mb-2 px-2.5 py-1 rounded border text-xs font-semibold ${badgeClass}`}>
+                    {badgeLabel}
+                  </div>
+                );
+              })()}
               
               {/* Registry Info */}
               <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs mb-3 border-b border-slate-700 pb-2">
@@ -1864,13 +2033,15 @@ export default function TubeSheetCanvas({ unitId, highlightTubes, filterSourceYe
                       <>
                         <span className="text-slate-400 mt-1">實際處置:</span>
                         <span className={`font-mono mt-1 font-bold ${
-                          maintenanceRecords[hoveredTube.id]?.action && maintenanceRecords[hoveredTube.id]?.action !== 'KEP'
+                          isDisposalAction(maintenanceRecords[hoveredTube.id]?.action)
                             ? 'text-emerald-400'
                             : 'text-slate-400'
                         }`}>
-                          {maintenanceRecords[hoveredTube.id]?.action === 'KEP'
-                            ? '無特別處置 (保留)'
-                            : (maintenanceRecords[hoveredTube.id]?.action || '無特別處置')}
+                          {!maintenanceRecords[hoveredTube.id]?.action
+                            ? '無特別處置'
+                            : normalizeMaintAction(maintenanceRecords[hoveredTube.id]?.action) === 'KEP'
+                              ? '無特別處置 (保留)'
+                              : formatMaintActionLabel(maintenanceRecords[hoveredTube.id]?.action)}
                         </span>
                         <span className="text-slate-400 mt-1">處置備註 (After):</span>
                         <span className={`text-xs mt-1 self-center leading-tight break-words ${maintenanceRecords[hoveredTube.id]?.notes ? 'text-emerald-300' : 'text-slate-500'}`}>
